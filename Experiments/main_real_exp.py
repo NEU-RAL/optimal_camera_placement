@@ -39,12 +39,6 @@ if __name__ == '__main__':
     best_configs = []
     best_configs_fw = []
 
-    # best_config_g, best_selection_indices, best_score_g = fwolf.greedy_selection_new(measurements, intrinsics, T_c4_c, points,
-    #                                                                                  poses, select_k, h_prior,
-    #                                                                                  metric=methods.Metric.min_eig)
-    #
-    # print("The score for traj greedy: {:.15f} ".format(best_score_g))
-
     ''' Construct factor graph as if we have all the 300 cameras. edges going between the poses and the landmarks'''
     ''' write the infomat as a combination of the selection variables.'''
     inf_mats, debug_nr_facs = fwolf.construct_candidate_inf_mats(measurements, intrinsics, T_c4_c, points, poses)

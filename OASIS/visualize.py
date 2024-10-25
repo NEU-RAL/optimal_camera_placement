@@ -12,6 +12,7 @@ def reset():
     global figno
     figno = 1
     plt.close("all")
+
 def initialize_3d_plot(number=None, title='Plot', axis_labels=['x', 'y', 'z'],view=[None,None],limits=None):
     fig = plt.figure(number)
     fig.clf()
@@ -40,6 +41,7 @@ def plot_3d_points(axes, vals, line_obj=None, *args, **kwargs):
         line_obj.set_data(vals[:,0], vals[:,1])
         line_obj.set_3d_properties(vals[:,2])
         return line_obj
+
 def initialize_2d_plot(number=None, title='Plot', axis_labels=['x', 'y'],limits=None):
     global figno
     fig = plt.figure(figno)

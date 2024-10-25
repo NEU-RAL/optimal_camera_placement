@@ -81,15 +81,7 @@ def build_graph(measurements, poses, points, intrinsics, extrinsics, inds=[], rm
                     dict_lm_poses[j] = {i}
                 else:
                     dict_lm_poses[j].add(i)
-                #
-                # if dict_lm_facs.get(j) is None:
-                #     dict_lm_facs[j] = [graph.nrFactors() - 1]
-                # else:
-                #     dict_lm_facs[j] = dict_lm_facs[j] + [graph.nrFactors() - 1]
 
-    # print(graph.keys())
-    # print("Number of factors in graph"+str(graph.nrFactors()))
-    ###graph.print('Factor Graph:\n')
     rm_indices = []
     rm_lm_indices = []
     uniq_poses = set()
@@ -206,9 +198,6 @@ def construct_candidate_inf_mats(measurements, intrinsics, extr_cand, points, po
         debug_num_facs.append(graph.nrFactors())
         i = i + 1
     print("Number of candidates : "+ str(i))
-    # hfull, _, _ , _, _= build_hfull(measurements, points, poses, intrinsics, extr_cand)
-    # hdiff = hfull - h_sum
-    # print(np.allclose(hfull, h_sum))
     return inf_mats,debug_num_facs
 
 def compute_info_metric(poses, points, meas, intrinsics, cands, selection, h_prior):

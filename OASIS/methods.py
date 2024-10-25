@@ -25,55 +25,6 @@ class Metric(Enum):
     min_eig = 2
     mse = 3
 
-def run_frank_wolfe_with_setup(points, poses, K, pose_rots, pose_trans, num_cands, n_iters, A, b):
-    """
-    Run Franke-Wolfe optimization without using a greedy initialization.
-    This includes setting up the candidate poses and constructing the information matrices.
-
-    Args:
-        points: The 3D points to observe.
-        poses: Initial poses for evaluation.
-        K: Camera calibration matrix.
-        pose_rots: Candidate rotations for poses.
-        pose_trans: Candidate translations for poses.
-        num_cands: Number of candidate configurations.
-        n_iters: Number of Frank-Wolfe iterations.
-        A: Constraint matrix.
-        b: Constraint vector.
-
-    Returns:
-        final_solution: Final selection after optimization.
-        min_eig_val: Minimum eigenvalue of the final solution.
-    """
-    #Set up candidate poses and construct factor graphs
-    inf_mats = []
-    for j, trans in enumerate(pose_trans):
-        for k, rot in enumerate(pose_rots):
-            c1 = gtsam.Pose3(gtsam.Rot3(rot), gtsam.Point3(trans[0], trans[1], trans[2]))
-            # Construct the factor graph for this candidate pose
-            graph, gtvals, poses_mask, points_mask = getMLE_multicam(poses, points, [c1], K, np.ones(len(points)))
-            fim, _ = infmat.compute_CRLB(gtvals, graph)
-            inf_mats.append(fim)
-
-    #Construct the prior information matrix H0
-    num_poses = len(poses)
-    num_points = len(points)
-    H0 = np.zeros((num_poses * 6 + num_points * 3, num_poses * 6 + num_points * 3))
-    H0[-num_poses * 6:, -num_poses * 6:] = np.eye(num_poses * 6)
-    H0[0: -num_poses * 6, 0: -num_poses * 6] = np.eye(num_points * 3)
-
-    #Initialize the selection for Frank-Wolfe
-    selection_init = np.ones(num_cands) * len(A[0]) / num_cands
-
-    #Run Frank-Wolfe algorithm
-    final_solution, selection_cur, min_eig_val, min_eig_val_unrounded, num_iters_completed = gen_frank_wolfe(
-        inf_mats, H0, n_iters, selection_init, len(A[0]), num_poses, A, b
-    )
-
-    print(f"Final minimum eigenvalue after Frank-Wolfe: {min_eig_val:.9f}")
-    return final_solution, min_eig_val
-
-
 '''
 methods to run the algorithms to minimize the expectation over multiple trajectories
 '''
@@ -328,84 +279,6 @@ def greedy_selection_exp(measurements, intrinsics, all_cands, points, poses, Nc,
 
     return best_config, best_selection_indices, best_score
 
-def gen_frank_wolfe(inf_mats, H0, n_iters, selection_init, k, num_poses, A, b):
-    """
-    Franke-Wolfe optimization method with added constraints.
-
-    Arguments:
-    inf_mats -- The information matrices.
-    H0 -- Prior information matrix.
-    n_iters -- Number of iterations.
-    selection_init -- Initial sensor selection.
-    k -- Number of sensors to select.
-    num_poses -- Number of poses.
-    A -- Constraint matrix (for cost, weight, etc.).
-    b -- Constraint vector (limits for cost, weight, etc.).
-
-    Returns:
-    final_solution -- Final sensor selection after optimization.
-    selection_cur -- Current selection at the end of optimization.
-    min_eig_val -- Minimum eigenvalue of the final solution.
-    min_eig_val_unrounded -- Minimum eigenvalue of the unrounded solution.
-    i -- Final iteration count.
-    """
-
-    selection_cur = selection_init
-    u_i = float("inf")
-    prev_min_eig = 0
-
-    for i in range(n_iters):
-        # Compute the minimum eigenvalue and eigenvector
-        min_eig_val, min_eig_vec, final_inf_mat = infmat.find_min_eig_pair(inf_mats, selection_cur, H0, num_poses)
-
-        # Compute gradient
-        grad = np.zeros(selection_cur.shape)
-        Hxx = final_inf_mat[-num_poses * 6:, -num_poses * 6:]
-        Hll = final_inf_mat[0: -num_poses * 6, 0: -num_poses * 6:]
-        Hlx = final_inf_mat[0: -num_poses * 6, -num_poses * 6:]
-
-        for ind in range(selection_cur.shape[0]):
-            Hc = inf_mats[ind]
-            Hxx_c = Hc[-num_poses * 6:, -num_poses * 6:]
-            Hll_c = Hc[0: -num_poses * 6, 0: -num_poses * 6:]
-            Hlx_c = Hc[0: -num_poses * 6, -num_poses * 6:]
-            t0 = Hlx.T
-            t1 = np.linalg.pinv(Hll)
-            t2 = t0 @ t1
-            grad_schur = Hxx_c - (Hlx_c.T @ t1 @ t0.T  - t2 @ Hll_c @ t1 @ t0.T + t2 @ Hlx_c)
-            grad[ind] = min_eig_vec.T @ grad_schur @ min_eig_vec
-
-        # Solve the constrained linear subproblem using linprog
-        result = linprog(c=-grad, A_ub=A, b_ub=b, bounds=(0, 1), method='highs')
-
-        # The rounded solution from linprog
-        rounded_sol = result.x
-
-        # Stopping criteria
-        if abs(min_eig_val - prev_min_eig) < 1e-7:
-            break
-
-        # Step size
-        alpha = 1.0 / (i + 2.0)
-        print(f"step size: {alpha:.9f}, iter : {i:.9f}, gradient norm : {np.linalg.norm(grad):.9f}, min eig : {min_eig_val:.15f}")
-
-        prev_min_eig = min_eig_val
-
-        # Update the selection
-        selection_cur = selection_cur + alpha * (rounded_sol - selection_cur)
-
-    print("ended the optimization")
-    print(f"norm of the gradient : {np.linalg.norm(selection_cur):.6f}")
-    print(selection_cur)
-
-    final_solution = roundsolution(selection_cur, k)
-    print(final_solution)
-
-    min_eig_val_unrounded, _, _ = infmat.find_min_eig_pair(inf_mats, selection_cur, H0, num_poses)
-    min_eig_val, _, _ = infmat.find_min_eig_pair(inf_mats, final_solution, H0, num_poses)
-
-    return final_solution, selection_cur, min_eig_val, min_eig_val_unrounded, i
-
 def gen_frank_wolfe_exp(inf_mats, H0, n_iters, selection_init, k, num_poses, num_runs, A, b):
     """
     Franke-Wolfe optimization method for multiple trajectories with added constraints.
@@ -496,57 +369,6 @@ def gen_frank_wolfe_exp(inf_mats, H0, n_iters, selection_init, k, num_poses, num
         min_eig_val_rounded += min_eig_val
 
     return final_solution, selection_cur, min_eig_val_rounded, min_eig_val_unrounded, i
-
-def frank_wolfe(inf_mats, H0, n_iters, selection_init, k, num_poses):
-    selection_cur= selection_init
-    u_i = float("inf")
-    prev_min_eig = 0
-    for i in range(n_iters):
-        #compute the minimum eigen value and eigen vector
-        min_eig_val, min_eig_vec, final_inf_mat = infmat.find_min_eig_pair(inf_mats, selection_cur, H0, num_poses)
-        #Compute gradient
-        grad = np.zeros(selection_cur.shape)
-        ''' required for gradient of schur'''
-        Hxx = final_inf_mat[-num_poses * 6:, -num_poses * 6:]
-        Hll = final_inf_mat[0: -num_poses * 6, 0: -num_poses * 6:]
-        Hlx = final_inf_mat[0: -num_poses * 6, -num_poses * 6:]
-        for ind in range(selection_cur.shape[0]):
-            #grad[ind] = min_eig_vec.T @ inf_mats[ind] @ min_eig_vec
-            #gradient schur
-            Hc = inf_mats[ind]
-            Hxx_c = Hc[-num_poses * 6:, -num_poses * 6:]
-            Hll_c = Hc[0: -num_poses * 6, 0: -num_poses * 6:]
-            Hlx_c = Hc[0: -num_poses * 6, -num_poses * 6:]
-            t0 = Hlx.T
-            t1 = np.linalg.pinv(Hll)
-            t2 = t0 @ t1
-            grad_schur = Hxx_c - (Hlx_c.T @ t1 @ t0.T  - t2 @ Hll_c @ t1 @ t0.T + t2 @ Hlx_c )
-            grad[ind] = min_eig_vec.T @ grad_schur @ min_eig_vec
-
-        #round the solution and pick top k
-        rounded_sol = roundsolution(grad, k)
-
-        if abs(min_eig_val - prev_min_eig) < 1e-7:   #1e-8 for prior of 1
-            break
-        # Step size
-        alpha = 1.0 / (i + 2.0)  # original 2.0 / (i + 2.0). Was playing around with this.
-        print("step size: {:.9f}, iter : {:.9f}, gradient norm : {:.9f}, min eig : {:.15f}".format(alpha, i,
-                                                                                                 np.linalg.norm(grad),
-                                                                                                 min_eig_val))
-        prev_min_eig = min_eig_val
-        selection_cur = selection_cur + alpha * (rounded_sol - selection_cur)
-
-    print("ended the optimization")
-    #final_solution = roundsolution(selection_cur, k)
-    print("norm of the gradient : {:.6f}".format(np.linalg.norm(selection_cur)))
-    print(selection_cur)
-
-    #final_solution = roundsolution_breakties(selection_cur, k, inf_mats, H0)
-    final_solution = roundsolution(selection_cur, k)
-    print(final_solution)
-    min_eig_val_unrounded, _, _ = infmat.find_min_eig_pair(inf_mats, selection_cur, H0, num_poses)
-    min_eig_val, _, _ = infmat.find_min_eig_pair(inf_mats, final_solution, H0, num_poses)
-    return final_solution, selection_cur, min_eig_val, min_eig_val_unrounded, i
 
 def frank_wolfe_exp(inf_mats, H0, n_iters, selection_init, k, num_poses, num_runs):
     selection_cur= selection_init
@@ -649,6 +471,14 @@ def run_single_experiment_exp(poses, points, measurements, intrinsics, extr_cand
     ''' Define A matrix and b vector for constraints (e.g., select exactly/at most k candidates) '''
     A = np.ones((1, num_cands))
     b = np.array([select_k])
+
+    # Generate all pairs of candidate indices
+    for pair in combinations(range(num_cands), 2):
+        exclusivity_row = np.zeros(num_cands)  # Create a row of zeros
+        exclusivity_row[pair[0]] = 1           # Set the first candidate of the pair
+        exclusivity_row[pair[1]] = 1           # Set the second candidate of the pair
+        A = np.vstack([A, exclusivity_row])    # Add this row to the A matrix
+        b = np.append(b, 1) 
 
     ''' Initial selection (equal weights or based on greedy) '''
     selection_init = np.ones(num_cands)
@@ -1057,8 +887,6 @@ def roundsolution_breakties(selection,k, all_mats, H0):
         eigvals, _ = la.eigh(m_p)
         all_eigs.append(eigvals[0])
     all_eigs = np.array(all_eigs)
-    # print(all_eigs[np.argsort(s_rnd)])
-    # print("----------------------------")
 
     zipped_vals = np.array([(s_rnd[i], all_eigs[i]) for i in range(len(s_rnd))], dtype=[('w', 'float'), ('weight', 'float')])
     idx = np.argpartition(zipped_vals, -k, order=['w', 'weight'])[-k:]
@@ -1125,4 +953,3 @@ def scipy_minimize(inf_mats,H0, selection_init, k,num_poses):
     min_eig_val_unr, _, _ = find_min_eig_pair(inf_mats, res.x, H0, num_poses)
     min_eig_val_rounded, _, _ = find_min_eig_pair(inf_mats, rounded_sol, H0, num_poses)
     return rounded_sol,res.x,  min_eig_val_rounded, min_eig_val_unr
-
