@@ -251,9 +251,6 @@ def greedy_selection_exp(measurements, intrinsics, all_cands, points, poses, Nc,
                     if metric == Metric.logdet:
                         sign, least_fim_eig = np.linalg.slogdet(fim)
                         least_fim_eig = sign * least_fim_eig
-                        # print(np.linalg.det(fim))
-                        # print(least_fim_eig)
-                        # print("-------------------------")
                     if metric == Metric.min_eig:
                         assert (utilities.check_symmetric(fim))
                         #print( np.linalg.eigvalsh(fim)[0:8])
@@ -490,56 +487,6 @@ def run_single_experiment_exp(poses, points, measurements, intrinsics, extr_cand
     print("################# FRANK-WOLFE SELECTION ############################")
     selection_fw, selection_fw_unr, cost_fw, cost_fw_unrounded, num_iters = frank_wolfe_exp(
         all_inf_mats, h_prior, 600, selection_init.flatten(), select_k, num_poses, num_runs)
-
-    e_f = time.time()
-    print("The Score for traj franke_wolfe with solution. rounded: {:.9f}, unrounded: {:.9f} ".format(cost_fw, cost_fw_unrounded))
-    print("selection: ")
-    print(np.argwhere(selection_fw == 1))
-
-    time_fw = (e_opt_prep - s_opt_prep) + (e_f - s_f)
-
-    ''' Return results '''
-    best_selection_indices_fw = []
-    best_configs_fw = []
-    for i in range(selection_fw.shape[0]):
-        if selection_fw[i] == 1:
-            best_configs_fw.append(extr_cand[i])
-            best_selection_indices_fw.append(i)
-
-    return best_score_g, best_config_g, best_selection_indices, time_greedy, cost_fw, cost_fw_unrounded, best_configs_fw,\
-           best_selection_indices_fw, selection_fw_unr, time_fw, num_iters
-
-def run_single_experiment(poses, points, measurements, intrinsics, extr_cand, select_k, h_prior, A, b):
-
-    ''' Perform greedy selection method using minimum eigen value metric '''
-    s_g = time.time()
-    best_config_g, best_selection_indices, best_score_g = greedy_selection_new(
-        measurements, intrinsics, extr_cand, points, poses, select_k, h_prior, metric=Metric.min_eig)
-    e_g = time.time()
-    time_greedy = e_g - s_g
-
-    print("The score for traj greedy: {:.9f} ".format(best_score_g))
-
-    ''' Construct factor graph and infomats '''
-    s_opt_prep = time.time()
-    inf_mats, debug_nr_facs = infmat.construct_candidate_inf_mats(measurements, intrinsics, extr_cand, points, poses)
-    num_cands = len(extr_cand)
-    e_opt_prep = time.time()
-
-    ''' Define A matrix and b vector for constraints (e.g., select exactly/at most k candidates) '''
-    A = np.ones((1, num_cands))
-    b = np.array([select_k])
-
-    ''' Initial selection (equal weights or based on greedy) '''
-    selection_init = np.ones(num_cands)
-    selection_init = selection_init * select_k / num_cands
-    num_poses = len(poses)
-
-    ''' Run Frank-Wolfe with A and b constraints '''
-    s_f = time.time()
-    print("################# FRANK-WOLFE SELECTION ############################")
-    selection_fw, selection_fw_unr, cost_fw, cost_fw_unrounded, num_iters = gen_frank_wolfe(
-        inf_mats, h_prior, 600, selection_init.flatten(), select_k, num_poses, A, b)
 
     e_f = time.time()
     print("The Score for traj franke_wolfe with solution. rounded: {:.9f}, unrounded: {:.9f} ".format(cost_fw, cost_fw_unrounded))
