@@ -1,4 +1,4 @@
-from OASIS import utilities
+import utilities
 from gtsam import Point3, Cal3_S2, PinholeCameraCal3_S2
 import numpy as np
 import gtsam
@@ -490,21 +490,21 @@ def compute_info_metric(poses, points, sensor_data, sensor_types, extrinsics, se
 #     least_fim_eig = np.linalg.eigvalsh(fim)[0]
 #     return least_fim_eig
 
-# def find_min_eig_pair(inf_mats, selection, H0, num_poses):
-#     """
-#     Finds the minimum eigenvalue and eigenvector for the selected sensors.
-#     Args:
-#         inf_mats (np.ndarray): Array of information matrices for each candidate.
-#         selection (np.ndarray): Binary vector indicating selected sensors.
-#         H0 (np.ndarray): Prior information matrix.
-#         num_poses (int): Number of poses.
+def find_min_eig_pair(inf_mats, selection, H0, num_poses):
+    """
+    Finds the minimum eigenvalue and eigenvector for the selected sensors.
+    Args:
+        inf_mats (np.ndarray): Array of information matrices for each candidate.
+        selection (np.ndarray): Binary vector indicating selected sensors.
+        H0 (np.ndarray): Prior information matrix.
+        num_poses (int): Number of poses.
 
-#     Returns:
-#         tuple: Smallest eigenvalue, eigenvector, and final FIM.
-#     """
-#     inds = np.where(selection > 1e-10)[0]
-#     final_inf_mat = sum(selection[i] * inf_mats[i] for i in inds) + H0
-#     H_schur = compute_schur_fim(final_inf_mat, num_poses)
-#     assert utilities.check_symmetric(H_schur)
-#     eigvals, eigvecs = la.eigh(H_schur)
-#     return eigvals[0], eigvecs[:, 0], final_inf_mat
+    Returns:
+        tuple: Smallest eigenvalue, eigenvector, and final FIM.
+    """
+    inds = np.where(selection > 1e-10)[0]
+    final_inf_mat = sum(selection[i] * inf_mats[i] for i in inds) + H0
+    H_schur = compute_schur_fim(final_inf_mat, num_poses)
+    assert utilities.check_symmetric(H_schur)
+    eigvals, eigvecs = la.eigh(H_schur)
+    return eigvals[0], eigvecs[:, 0], final_inf_mat

@@ -4,16 +4,16 @@ from scipy.optimize import linprog
 import gtsam
 from enum import Enum
 from enum import Enum
-from . import utilities
-from . import visualize
+import utilities
+import FIM as infmat
+import visualize
 import numpy as np
 import matplotlib.pyplot as plt
 from functools import partial
 from typing import List, Optional
 import time
 from gtsam.utils import plot
-from ProblemBuilder import FIM as infmat
-from Experiments import exp_utils
+# from Experiments import exp_utils
 from scipy.optimize import minimize, Bounds
 from numpy import linalg as la
 
