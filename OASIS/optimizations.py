@@ -1,6 +1,6 @@
 from typing import List, Optional, Tuple
 import numpy as np
-from scipy.optimize import linprog
+from scipy.optimize import linprog, minimize_scalar
 import gtsam
 from enum import Enum
 from enum import Enum
@@ -29,7 +29,7 @@ def greedy_selection(
     inf_mat: np.ndarray,
     prior: np.ndarray,
     Nc: int,
-    metric: Metric = Metric.LOGDET,
+    metric: Metric = Metric.MIN_EIG,
     num_runs: int = 1,
 ) -> Tuple[List[int], float, np.ndarray]:
     """
@@ -87,7 +87,9 @@ def greedy_selection(
 
     print("Selected candidates are:", best_selection_indices)
 
-    return best_selection_indices, best_score, avail_cand
+    selection_vector = np.zeros(len(inf_mat))
+    selection_vector[best_selection_indices] = 1
+    return selection_vector, best_score, avail_cand
 
 def frank_wolfe_optimization(
     inf_mats: List[np.ndarray],
@@ -101,7 +103,7 @@ def frank_wolfe_optimization(
     b: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, float, float, int]:
     """
-    Frank-Wolfe optimization method with constraints for multiple runs.
+    Frank-Wolfe optimization method with constraints for multiple runs, without rounding the final solution.
 
     Args:
         inf_mats: Information matrices for each trajectory.
@@ -115,10 +117,9 @@ def frank_wolfe_optimization(
         b: Constraint vector.
 
     Returns:
-        final_solution: Final sensor selection.
-        selection_cur: Current selection at the end of optimization.
-        min_eig_val_rounded: Minimum eigenvalue for the rounded solution.
-        min_eig_val_unrounded: Minimum eigenvalue for the unrounded solution.
+        selection_cur: Final continuous sensor selection.
+        min_eig_val_rounded: Minimum eigenvalue for the solution constrained to k sensors.
+        min_eig_val_unrounded: Minimum eigenvalue for the continuous solution.
         i: Final iteration count.
     """
     selection_cur = selection_init
@@ -147,25 +148,28 @@ def frank_wolfe_optimization(
         rounded_sol = result.x
 
         # Stopping criterion
-        if abs(min_eig_val_score - prev_min_eig_score) < 1e-4:
+        if abs(min_eig_val_score - prev_min_eig_score) < 1e-10:
             break
 
-        # Step size and update
-        alpha = 1.0 / (i + 3.0)
+        # Define line search objective
+        def line_search_objective(alpha):
+            new_selection = selection_cur + alpha * (rounded_sol - selection_cur)
+            score = 0
+            for traj_ind in range(num_runs):
+                min_eig_val, _, _ = infmat.find_min_eig_pair(
+                    inf_mats[traj_ind], new_selection, prior, num_poses
+                )
+                score += min_eig_val
+            return -score  # Negate because we want to maximize min eigenvalue
+
+        # Perform line search to find optimal alpha
+        line_search_result = minimize_scalar(line_search_objective, bounds=(0, 1), method='bounded')
+        alpha = line_search_result.x  # Use the optimal alpha from line search
+
         prev_min_eig_score = min_eig_val_score
         selection_cur = selection_cur + alpha * (rounded_sol - selection_cur)
 
-    # Final rounding
-    final_solution = np.round(selection_cur)[:k]
-    min_eig_val_unrounded = sum(
-        infmat.find_min_eig_pair(inf, selection_cur, prior, num_poses)[0] for inf in inf_mats
-    )
-    min_eig_val_rounded = sum(
-        infmat.find_min_eig_pair(inf, final_solution, prior, num_poses)[0] for inf in inf_mats
-    )
-
-    return final_solution, selection_cur, min_eig_val_rounded, min_eig_val_unrounded, i
-
+    return selection_cur, min_eig_val_score, i
 
 def roundsolution(selection, k):
     """
@@ -234,9 +238,9 @@ def roundsolution_madow(selection, k):
         np.ndarray: Binary vector with exactly `k` elements selected probabilistically based on their cumulative weights.
     """
     num = len(selection)
-    phi = np.zeros(num)
+    phi = np.zeros(num + 1)  # Increase size by 1 to avoid out-of-bounds access
     rounded_sol = np.zeros(num)
-    phi[1:] = np.cumsum(selection[1:])  # Cumulative sum of selection scores
+    phi[1:] = np.cumsum(selection)  # Cumulative sum of selection scores
     u = np.random.rand()  # Random number for probabilistic selection
 
     for i in range(k):
@@ -396,7 +400,7 @@ def min_eig_obj_with_jac(x, inf_mats, H0, num_poses):
         Tuple[float, np.ndarray]: The negative minimum eigenvalue (objective value) and its gradient.
     """
     # Compute the minimum eigenvalue and eigenvector for the given selection vector x
-    min_eig_val, min_eig_vec, final_inf_mat = find_min_eig_pair(inf_mats, x, H0, num_poses)
+    min_eig_val, min_eig_vec, final_inf_mat = infmat.find_min_eig_pair(inf_mats, x, H0, num_poses)
     
     # Initialize the gradient
     grad = np.zeros(x.shape)
@@ -470,7 +474,7 @@ def scipy_minimize(inf_mats, H0, selection_init, k, num_poses):
     print("Rounded solution:", rounded_sol)
     
     # Calculate minimum eigenvalues for both the continuous (`res.x`) and rounded (`rounded_sol`) solutions
-    min_eig_val_unr, _, _ = find_min_eig_pair(inf_mats, res.x, H0, num_poses)
-    min_eig_val_rounded, _, _ = find_min_eig_pair(inf_mats, rounded_sol, H0, num_poses)
+    min_eig_val_unr, _, _ = infmat.find_min_eig_pair(inf_mats, res.x, H0, num_poses)
+    min_eig_val_rounded, _, _ = infmat.find_min_eig_pair(inf_mats, rounded_sol, H0, num_poses)
     
     return rounded_sol, res.x, min_eig_val_rounded, min_eig_val_unr

@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.optimize import linprog, minimize
 import time
-from optimizations import greedy_selection, frank_wolfe_optimization, scipy_minimize
+from optimizations import greedy_selection, frank_wolfe_optimization, scipy_minimize, roundsolution, roundsolution_breakties, roundsolution_madow, branch_and_bound_with_cuts
 from enum import Enum
 
 # Define Metric Enum for selection
@@ -23,22 +23,22 @@ def generate_random_fim(num_matrices, matrix_size):
     inf_mats = []
     for _ in range(num_matrices):
         A = np.random.rand(matrix_size, matrix_size)
-        inf_mat = A @ A.T  # Ensures the matrix is symmetric positive-definite
+        inf_mat = A @ A.T
         inf_mats.append(inf_mat)
     return inf_mats
 
 # Parameters for testing
 num_matrices = 10  # Number of sensor candidates
-matrix_size = 12   # Size of each FIM matrix (depends on num_poses and num_points)
+matrix_size = 12   # Size of each FIM matrix
 num_poses = 10
 num_runs = 1
 k = 5               # Number of sensors to select
-n_iters = 50        # Number of iterations for Frank-Wolfe optimization
+n_iters = 1000       # Number of iterations for Frank-Wolfe optimization
 
 # Generate synthetic data
 inf_mats = generate_random_fim(num_matrices, matrix_size)
-H0 = np.eye(matrix_size) * 0.1  # Prior matrix as a small regularization term
-selection_init = np.ones(num_matrices) / num_matrices  # Initial selection vector
+H0 = np.eye(matrix_size)  # Prior matrix as a small regularization term
+selection_init = np.ones(num_matrices) / num_matrices 
 
 # Constraint setup for Frank-Wolfe
 A = np.ones((1, num_matrices))
@@ -54,19 +54,19 @@ def time_function(func, *args, **kwargs):
 
 # Run Greedy Selection
 print("\nRunning Greedy Selection")
-best_selection_indices, best_score, avail_cand = time_function(
+selection_vec, best_score, avail_cand = time_function(
     greedy_selection,
     inf_mat=np.array(inf_mats),
     prior=H0,
     Nc=k,
-    metric=Metric.LOGDET,
+    metric=Metric.MIN_EIG,
     num_runs=num_runs
 )
-print("Greedy Selection Results:", best_selection_indices, best_score)
+print("Greedy Selection Results:", selection_vec, best_score)
 
 # Run Frank-Wolfe Optimization
 print("\nRunning Frank-Wolfe Optimization")
-final_solution, selection_cur, min_eig_val_rounded, min_eig_val_unrounded, iter_count = time_function(
+final_solution, min_eig_val_rounded, i = time_function(
     frank_wolfe_optimization,
     inf_mats=inf_mats,
     prior=H0,
@@ -78,7 +78,55 @@ final_solution, selection_cur, min_eig_val_rounded, min_eig_val_unrounded, iter_
     A=A,
     b=b
 )
-print("Frank-Wolfe Optimization Results:", final_solution, min_eig_val_rounded, min_eig_val_unrounded)
+print("Frank-Wolfe Optimization Results:", final_solution, min_eig_val_rounded)
+
+# Run Frank-Wolfe Optimization
+print("\nRunning Frank-Wolfe Optimization with Greedy Solution")
+final_solution, min_eig_val_rounded, i = time_function(
+    frank_wolfe_optimization,
+    inf_mats=inf_mats,
+    prior=H0,
+    n_iters=n_iters,
+    selection_init=selection_vec,
+    k=k,
+    num_poses=num_poses,
+    num_runs=num_runs,
+    A=A,
+    b=b
+)
+print("Greedy-Frank-Wolfe Optimization Results:", final_solution, min_eig_val_rounded)
+
+# Basic Rounding
+basic_rounding_solution = roundsolution(final_solution, k)
+print("\nBasic Rounding Solution:", basic_rounding_solution)
+
+# Rounding with Tie-Breaking (using smallest eigenvalue)
+rounding_tie_break_solution = roundsolution_breakties(final_solution, k, inf_mats, H0)
+print("\nRounding with Tie-Breaking Solution:", rounding_tie_break_solution)
+
+# Madow's Rounding (Probabilistic Rounding)
+madow_rounding_solution = roundsolution_madow(final_solution, k)
+print("\nMadow's Probabilistic Rounding Solution:", madow_rounding_solution)
+
+# Branch-and-Bound with Cuts
+branch_and_bound_solution, branch_and_bound_score = branch_and_bound_with_cuts(
+    inf_mats=inf_mats,
+    H0=H0,
+    num_poses=num_poses,
+    k=k,
+    relaxed_solution=final_solution
+)
+print("\nBranch-and-Bound with Cuts Solution:", branch_and_bound_solution)
+print("\nBranch-and-Bound with Cuts Score:", branch_and_bound_score)
+
+# # Optional: Evaluate and print minimum eigenvalues for each solution
+# for label, sol in zip(
+#     ["Basic Rounding", "Tie-Breaking Rounding", "Madow's Rounding", "Branch-and-Bound"],
+#     [basic_rounding_solution, rounding_tie_break_solution, madow_rounding_solution, branch_and_bound_solution]
+# ):
+#     min_eig_val = evaluate_solution(inf_mats, H0, sol, num_poses)
+#     print(f"Minimum Eigenvalue for {label} Solution: {min_eig_val}")
+
 
 # Run Scipy Minimize Optimization
 print("\nRunning Scipy Minimize Optimization")

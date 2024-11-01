@@ -7,7 +7,7 @@ from functools import partial
 from typing import List, Optional
 import time
 import gtsam
-from scipy.optimize import linprog
+from scipy.optimize import linprog, minimize_scalar
 from gtsam.utils import plot
 from ProblemBuilder import FIM as infmat
 from gtsam import (DoglegOptimizer,
@@ -114,9 +114,6 @@ def greedy_selection(points, poses, K,pose_rots, pose_trans, Nc, metric= Metric.
                         if metric == Metric.logdet:
                             sign, least_fim_eig = np.linalg.slogdet(fim)
                             least_fim_eig = sign * least_fim_eig
-                            # print(np.linalg.det(fim))
-                            # print(least_fim_eig)
-                            # print("-------------------------")
                         if metric == Metric.min_eig:
                             assert(utilities.check_symmetric(fim))
                             least_fim_eig = np.linalg.eigvalsh(fim)[0]

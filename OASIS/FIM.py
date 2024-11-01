@@ -5,54 +5,56 @@ import gtsam
 from gtsam import (
     DoglegOptimizer, LevenbergMarquardtOptimizer,
     GenericProjectionFactorCal3_S2, NonlinearFactorGraph,
-    PriorFactorPoint3, PriorFactorPose3, Values, RangeFactor, ImuFactor,
+    PriorFactorPoint3, PriorFactorPose3, Values, ImuFactor,
     noiseModel
 )
+
+# RangeFactor,
 from numpy import linalg as la
 
 L = gtsam.symbol_shorthand.L
 X = gtsam.symbol_shorthand.X
 
-class CustomRangeBearingFactor(noiseModel.NoiseModelFactor):
-    def __init__(self, key1, key2, measurement, noise_model):
-        """
-        Initializes the radar factor with range and bearing measurements.
+# class CustomRangeBearingFactor(noiseModel.NoiseModelFactor):
+#     def __init__(self, key1, key2, measurement, noise_model):
+#         """
+#         Initializes the radar factor with range and bearing measurements.
         
-        Args:
-            key1 (int): Key for the sensor pose in the factor graph.
-            key2 (int): Key for the target point (landmark) in the factor graph.
-            measurement (array-like): Measured [range, bearing] to the target.
-            noise_model (gtsam.noiseModel): Noise model for the measurement.
-        """
-        super().__init__(noise_model, key1, key2)
-        self.measurement = measurement  # Expected format: [range, bearing]
+#         Args:
+#             key1 (int): Key for the sensor pose in the factor graph.
+#             key2 (int): Key for the target point (landmark) in the factor graph.
+#             measurement (array-like): Measured [range, bearing] to the target.
+#             noise_model (gtsam.noiseModel): Noise model for the measurement.
+#         """
+#         super().__init__(noise_model, key1, key2)
+#         self.measurement = measurement  # Expected format: [range, bearing]
 
-    def error(self, values):
-        """
-        Computes the error between the predicted and measured range and bearing.
+#     def error(self, values):
+#         """
+#         Computes the error between the predicted and measured range and bearing.
         
-        Args:
-            values (Values): The current values (estimates) in the factor graph.
+#         Args:
+#             values (Values): The current values (estimates) in the factor graph.
 
-        Returns:
-            np.ndarray: The error vector, which is [range_error, bearing_error].
-        """
-        # Retrieve the sensor pose and target point (landmark) from the graph's values
-        pose = values.atPose3(self.keys[0])
-        point = values.atPoint3(self.keys[1])
+#         Returns:
+#             np.ndarray: The error vector, which is [range_error, bearing_error].
+#         """
+#         # Retrieve the sensor pose and target point (landmark) from the graph's values
+#         pose = values.atPose3(self.keys[0])
+#         point = values.atPoint3(self.keys[1])
 
-        # Calculate the relative position from the sensor pose to the target point
-        relative_position = pose.transform_to(point)
+#         # Calculate the relative position from the sensor pose to the target point
+#         relative_position = pose.transform_to(point)
 
-        # Calculate predicted range and bearing
-        range_predicted = np.linalg.norm(relative_position)
-        bearing_predicted = np.arctan2(relative_position.y(), relative_position.x())
+#         # Calculate predicted range and bearing
+#         range_predicted = np.linalg.norm(relative_position)
+#         bearing_predicted = np.arctan2(relative_position.y(), relative_position.x())
 
-        # Calculate the error as the difference between predicted and measured values
-        range_error = range_predicted - self.measurement[0]
-        bearing_error = bearing_predicted - self.measurement[1]
+#         # Calculate the error as the difference between predicted and measured values
+#         range_error = range_predicted - self.measurement[0]
+#         bearing_error = bearing_predicted - self.measurement[1]
 
-        return np.array([range_error, bearing_error])
+#         return np.array([range_error, bearing_error])
 
 
 def build_graph(sensor_data, poses, points, extrinsics, sensor_types, remove_ill_posed=False):
@@ -91,32 +93,32 @@ def build_graph(sensor_data, poses, points, extrinsics, sensor_types, remove_ill
                 factor = PriorFactorPoint3(L(i), gps_position, noise_models['GPS'])
                 graph.add(factor)
 
-        elif sensor_type == 'IMU':
-            # Add IMU factors: integrated motion constraints between consecutive poses
-            imu_data = sensor_data[sensor_id]
-            for i in range(1, len(poses)):
-                prev_pose = poses[i - 1]
-                curr_pose = poses[i]
-                factor = ImuFactor(X(i - 1), X(i), imu_data[i - 1], noise_models['IMU'])
-                graph.add(factor)
+        # elif sensor_type == 'IMU':
+        #     # Add IMU factors: integrated motion constraints between consecutive poses
+        #     imu_data = sensor_data[sensor_id]
+        #     for i in range(1, len(poses)):
+        #         prev_pose = poses[i - 1]
+        #         curr_pose = poses[i]
+        #         factor = ImuFactor(X(i - 1), X(i), imu_data[i - 1], noise_models['IMU'])
+        #         graph.add(factor)
 
-        elif sensor_type == 'LiDAR':
-            # Add LiDAR range factors between poses and points
-            for i, pose in enumerate(poses):
-                for j, point in enumerate(points):
-                    range_measurement = sensor_data[sensor_id]['ranges'][i, j]
-                    if range_measurement > 0:
-                        factor = RangeFactor(X(i), L(j), range_measurement, noise_models['LiDAR'])
-                        graph.add(factor)
+        # elif sensor_type == 'LiDAR':
+        #     # Add LiDAR range factors between poses and points
+        #     for i, pose in enumerate(poses):
+        #         for j, point in enumerate(points):
+        #             range_measurement = sensor_data[sensor_id]['ranges'][i, j]
+        #             if range_measurement > 0:
+        #                 factor = RangeFactor(X(i), L(j), range_measurement, noise_models['LiDAR'])
+        #                 graph.add(factor)
 
-        elif sensor_type == 'Radar':
-            # Add Radar factors: range and bearing between poses and points
-            for i, pose in enumerate(poses):
-                for j, point in enumerate(points):
-                    range_bearing = sensor_data[sensor_id]['range_bearing'][i, j]
-                    if range_bearing[0] > 0:  # Check if range is valid
-                        factor = CustomRangeBearingFactor(X(i), L(j), range_bearing, noise_models['Radar'])
-                        graph.add(factor)
+        # elif sensor_type == 'Radar':
+        #     # Add Radar factors: range and bearing between poses and points
+        #     for i, pose in enumerate(poses):
+        #         for j, point in enumerate(points):
+        #             range_bearing = sensor_data[sensor_id]['range_bearing'][i, j]
+        #             if range_bearing[0] > 0:  # Check if range is valid
+        #                 factor = CustomRangeBearingFactor(X(i), L(j), range_bearing, noise_models['Radar'])
+        #                 graph.add(factor)
 
     # Fill in ground truth values (optional based on setup)
     pose_mask = np.ones(len(poses))
@@ -162,8 +164,8 @@ def compute_schur_fim(fim, num_poses):
     Hll = fim[0: -num_poses * 6, 0: -num_poses * 6]  # Landmark-to-landmark information
     Hlx = fim[0: -num_poses * 6, -num_poses * 6:]  # Landmark-to-pose cross information
 
-    # Calculate the Schur complement: reduces dimensionality by eliminating landmark dependencies
     Hxx_schur = Hxx - Hlx.T @ np.linalg.pinv(Hll) @ Hlx
+    Hxx_schur = (Hxx_schur + Hxx_schur.T) / 2
 
     return Hxx_schur
 
