@@ -91,6 +91,7 @@ def greedy_selection(
     selection_vector[best_selection_indices] = 1
     return selection_vector, best_score, avail_cand
 
+
 def frank_wolfe_optimization(
     inf_mats: List[np.ndarray],
     prior: np.ndarray,
@@ -134,7 +135,6 @@ def frank_wolfe_optimization(
                 inf_mats[traj_ind], selection_cur, prior, num_poses
             )
             min_eig_val_score += min_eig_val
-
             Hxx = final_inf_mat[-num_poses * 6:, -num_poses * 6:]
             Hll = final_inf_mat[0: -num_poses * 6, 0: -num_poses * 6]
             Hlx = final_inf_mat[0: -num_poses * 6, -num_poses * 6:]
@@ -148,23 +148,11 @@ def frank_wolfe_optimization(
         rounded_sol = result.x
 
         # Stopping criterion
-        if abs(min_eig_val_score - prev_min_eig_score) < 1e-10:
+        if abs(min_eig_val_score - prev_min_eig_score) < 1e-5:
             break
 
-        # Define line search objective
-        def line_search_objective(alpha):
-            new_selection = selection_cur + alpha * (rounded_sol - selection_cur)
-            score = 0
-            for traj_ind in range(num_runs):
-                min_eig_val, _, _ = infmat.find_min_eig_pair(
-                    inf_mats[traj_ind], new_selection, prior, num_poses
-                )
-                score += min_eig_val
-            return -score  # Negate because we want to maximize min eigenvalue
-
-        # Perform line search to find optimal alpha
-        line_search_result = minimize_scalar(line_search_objective, bounds=(0, 1), method='bounded')
-        alpha = line_search_result.x  # Use the optimal alpha from line search
+        # Step size and update
+        alpha = 1.0 / (i + 10.0)
 
         prev_min_eig_score = min_eig_val_score
         selection_cur = selection_cur + alpha * (rounded_sol - selection_cur)
@@ -238,7 +226,7 @@ def roundsolution_madow(selection, k):
         np.ndarray: Binary vector with exactly `k` elements selected probabilistically based on their cumulative weights.
     """
     num = len(selection)
-    phi = np.zeros(num + 1)  # Increase size by 1 to avoid out-of-bounds access
+    phi = np.zeros(num + 1)  
     rounded_sol = np.zeros(num)
     phi[1:] = np.cumsum(selection)  # Cumulative sum of selection scores
     u = np.random.rand()  # Random number for probabilistic selection
@@ -383,10 +371,10 @@ def evaluate_solution(inf_mats, H0, solution, num_poses):
 ################################################################
 Scipy optimization methods
 '''
-
+# Not poses - dimensions
 def min_eig_obj_with_jac(x, inf_mats, H0, num_poses):
     """
-    Objective function for minimizing the smallest eigenvalue with respect to sensor selection.
+    Objective function for maximizing the smallest eigenvalue with respect to sensor selection.
     This function computes the minimum eigenvalue of the information matrix (FIM) and its gradient
     for optimization. It’s used as the objective function for `scipy_minimize`.
 
@@ -425,7 +413,6 @@ def min_eig_obj_with_jac(x, inf_mats, H0, num_poses):
         # Update the gradient with respect to the minimum eigenvalue direction
         grad[ind] = min_eig_vec.T @ grad_schur @ min_eig_vec
 
-    # Return the objective value and gradient for minimization
     return -1.0 * min_eig_val, -1.0 * grad
 
 
@@ -449,7 +436,6 @@ def scipy_minimize(inf_mats, H0, selection_init, k, num_poses):
     # Set bounds for each variable in x (between 0 and 1) to represent selection probabilities
     bounds = tuple([(0, 1) for _ in range(selection_init.shape[0])])
     
-    # Define constraint to enforce exactly `k` selections (sum of selection vector equals k)
     cons = (
         {'type': 'eq', 'fun': lambda x: np.sum(x) - k}
     )
@@ -469,12 +455,6 @@ def scipy_minimize(inf_mats, H0, selection_init, k, num_poses):
     # Print the continuous solution from the optimization
     print("Continuous solution from optimization:", res.x)
     
-    # Round the solution to select exactly k elements by using `roundsolution`
-    rounded_sol = roundsolution(res.x, k)
-    print("Rounded solution:", rounded_sol)
-    
-    # Calculate minimum eigenvalues for both the continuous (`res.x`) and rounded (`rounded_sol`) solutions
-    min_eig_val_unr, _, _ = infmat.find_min_eig_pair(inf_mats, res.x, H0, num_poses)
-    min_eig_val_rounded, _, _ = infmat.find_min_eig_pair(inf_mats, rounded_sol, H0, num_poses)
-    
-    return rounded_sol, res.x, min_eig_val_rounded, min_eig_val_unr
+    # Calculate minimum eigenvalues for both the continuous (`res.x`)
+    min_eig_val_unr, _, _ = infmat.find_min_eig_pair(inf_mats, res.x, H0, num_poses)    
+    return res.x, min_eig_val_unr

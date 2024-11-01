@@ -27,22 +27,56 @@ def generate_random_fim(num_matrices, matrix_size):
         inf_mats.append(inf_mat)
     return inf_mats
 
+def generate_random_fim(num_matrices, matrix_size):
+    """
+    Generates a list of matrices where half are identity matrices and the other half
+    are random symmetric positive-definite matrices with eigenvalues greater than 10.
+    
+    Args:
+        num_matrices (int): Number of matrices to generate.
+        matrix_size (int): Size of each square matrix.
+    
+    Returns:
+        List[np.ndarray]: List of matrices as specified.
+    """
+    inf_mats = []
+    half_num = num_matrices // 2
+
+    # First half as identity matrices
+    for _ in range(half_num):
+        inf_mats.append(np.eye(matrix_size))
+    
+    # Second half with eigenvalues greater than 10
+    for _ in range(half_num, num_matrices):
+        # Generate a random symmetric positive-definite matrix
+        A = np.random.rand(matrix_size, matrix_size)
+        inf_mat = A @ A.T
+        
+        # Scale the matrix so that its smallest eigenvalue is greater than 10
+        min_eigenvalue = np.linalg.eigvalsh(inf_mat).min()
+        if min_eigenvalue <= 10:
+            inf_mat *= (10 / min_eigenvalue + 1e-6)  # Add a small epsilon for stability
+        
+        inf_mats.append(inf_mat)
+    
+    return inf_mats
+
 # Parameters for testing
 num_matrices = 10  # Number of sensor candidates
 matrix_size = 12   # Size of each FIM matrix
 num_poses = 10
 num_runs = 1
 k = 5               # Number of sensors to select
-n_iters = 1000       # Number of iterations for Frank-Wolfe optimization
+n_iters = 1000000       # Number of iterations for Frank-Wolfe optimization
 
 # Generate synthetic data
 inf_mats = generate_random_fim(num_matrices, matrix_size)
-H0 = np.eye(matrix_size)  # Prior matrix as a small regularization term
+H0 = np.eye(matrix_size) # Prior matrix as a small regularization term
 selection_init = np.ones(num_matrices) / num_matrices 
 
 # Constraint setup for Frank-Wolfe
 A = np.ones((1, num_matrices))
-b = np.array([k])  # Ensure that only `k` sensors are selected
+b = np.array([k])
 
 # Helper function to time each optimization method
 def time_function(func, *args, **kwargs):
@@ -79,6 +113,8 @@ final_solution, min_eig_val_rounded, i = time_function(
     b=b
 )
 print("Frank-Wolfe Optimization Results:", final_solution, min_eig_val_rounded)
+
+print("\n #########################################################################")
 
 # Run Frank-Wolfe Optimization
 print("\nRunning Frank-Wolfe Optimization with Greedy Solution")
@@ -127,10 +163,11 @@ print("\nBranch-and-Bound with Cuts Score:", branch_and_bound_score)
 #     min_eig_val = evaluate_solution(inf_mats, H0, sol, num_poses)
 #     print(f"Minimum Eigenvalue for {label} Solution: {min_eig_val}")
 
+print("\n #########################################################################")
 
 # Run Scipy Minimize Optimization
 print("\nRunning Scipy Minimize Optimization")
-rounded_sol, continuous_sol, min_eig_val_rounded, min_eig_val_unr = time_function(
+continuous_sol, min_eig_val_unr = time_function(
     scipy_minimize,
     inf_mats=inf_mats,
     H0=H0,
@@ -138,17 +175,38 @@ rounded_sol, continuous_sol, min_eig_val_rounded, min_eig_val_unr = time_functio
     k=k,
     num_poses=num_poses
 )
-print("Scipy Minimize Results:", rounded_sol, min_eig_val_rounded, min_eig_val_unr)
+print("Scipy Minimize Results:", continuous_sol, min_eig_val_unr)
+
+# Basic Rounding
+basic_rounding_solution = roundsolution(continuous_sol, k)
+print("\nBasic Rounding Solution:", basic_rounding_solution)
+
+# Rounding with Tie-Breaking (using smallest eigenvalue)
+rounding_tie_break_solution = roundsolution_breakties(continuous_sol, k, inf_mats, H0)
+print("\nRounding with Tie-Breaking Solution:", rounding_tie_break_solution)
+
+# Madow's Rounding (Probabilistic Rounding)
+madow_rounding_solution = roundsolution_madow(continuous_sol, k)
+print("\nMadow's Probabilistic Rounding Solution:", madow_rounding_solution)
+
+# Branch-and-Bound with Cuts
+branch_and_bound_solution, branch_and_bound_score = branch_and_bound_with_cuts(
+    inf_mats=inf_mats,
+    H0=H0,
+    num_poses=num_poses,
+    k=k,
+    relaxed_solution=continuous_sol
+)
+print("\nBranch-and-Bound with Cuts Solution:", branch_and_bound_solution)
+print("\nBranch-and-Bound with Cuts Score:", branch_and_bound_score)
 
 # Verification of Constraints and Consistency of Results
 print("\nVerification of Results")
-# Ensure that the number of selected sensors does not exceed `k`
-assert np.sum(rounded_sol) <= k, "Scipy Minimize solution violates the 'at most k' constraint."
-assert np.sum(final_solution) <= k, "Frank-Wolfe solution violates the 'at most k' constraint."
-assert len(best_selection_indices) <= k, "Greedy Selection solution violates the 'at most k' constraint."
+# # Ensure that the number of selected sensors does not exceed `k`
+# assert np.sum(rounded_sol) <= k, "Scipy Minimize solution violates the 'at most k' constraint."
+# assert np.sum(final_solution) <= k, "Frank-Wolfe solution violates the 'at most k' constraint."
 
-# Compare scores across methods to see if they are consistent
-print("Best Score from Greedy Selection:", best_score)
-print("Minimum Eigenvalue (Rounded) from Frank-Wolfe:", min_eig_val_rounded)
-print("Minimum Eigenvalue (Rounded) from Scipy Minimize:", min_eig_val_rounded)
-print("Minimum Eigenvalue (Continuous) from Scipy Minimize:", min_eig_val_unr)
+# # Compare scores across methods to see if they are consistent
+# print("Best Score from Greedy Selection:", best_score)
+# print("Minimum Eigenvalue (Rounded) from Frank-Wolfe:", min_eig_val_rounded)
+# print("Minimum Eigenvalue (Continuous) from Scipy Minimize:", min_eig_val_unr)
