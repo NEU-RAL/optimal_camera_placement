@@ -274,6 +274,22 @@ def compute_info_metric(poses, points, sensor_data, sensor_types, extrinsics, se
 
     return least_fim_eig
 
+def combine_inf_mats(inf_mats, x):
+    """
+    Combines the information matrices weighted by the vector x.
+
+    Args:
+        inf_mats (List[np.ndarray]): List of information matrices.
+        x (np.ndarray): Weight vector.
+
+    Returns:
+        np.ndarray: Combined information matrix.
+    """
+    combined_inf_mat = np.zeros_like(inf_mats[0])
+    for xi, Hi in zip(x, inf_mats):
+        combined_inf_mat += xi * Hi
+    return combined_inf_mat
+
 
 
 # def compute_CRLB(vals, graph):

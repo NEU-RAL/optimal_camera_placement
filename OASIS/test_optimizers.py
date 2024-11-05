@@ -1,7 +1,15 @@
 import numpy as np
 from scipy.optimize import linprog, minimize
 import time
-from optimizations import greedy_selection, frank_wolfe_optimization, scipy_minimize, roundsolution, roundsolution_breakties, roundsolution_madow, branch_and_bound_with_cuts
+from optimizations import (
+    greedy_selection,
+    frank_wolfe_optimization,
+    scipy_minimize,
+    roundsolution,
+    roundsolution_breakties,
+    roundsolution_madow,
+    nsopy_optimize,
+    branch_and_bound_with_cuts)
 from enum import Enum
 
 # Define Metric Enum for selection
@@ -63,11 +71,11 @@ def generate_random_fim(num_matrices, matrix_size):
 
 # Parameters for testing
 num_matrices = 10  # Number of sensor candidates
-matrix_size = 12   # Size of each FIM matrix
 num_poses = 10
 num_runs = 1
 k = 5               # Number of sensors to select
-n_iters = 1000000       # Number of iterations for Frank-Wolfe optimization
+n_iters = 10000       # Number of iterations for Frank-Wolfe optimization
+matrix_size = 60
 
 # Generate synthetic data
 inf_mats = generate_random_fim(num_matrices, matrix_size)
@@ -90,7 +98,7 @@ def time_function(func, *args, **kwargs):
 print("\nRunning Greedy Selection")
 selection_vec, best_score, avail_cand = time_function(
     greedy_selection,
-    inf_mat=np.array(inf_mats),
+    inf_mats=np.array(inf_mats),
     prior=H0,
     Nc=k,
     metric=Metric.MIN_EIG,
@@ -108,7 +116,7 @@ final_solution, min_eig_val_rounded, i = time_function(
     selection_init=selection_init,
     k=k,
     num_poses=num_poses,
-    num_runs=num_runs,
+    # num_runs=num_runs,
     A=A,
     b=b
 )
@@ -116,7 +124,7 @@ print("Frank-Wolfe Optimization Results:", final_solution, min_eig_val_rounded)
 
 print("\n #########################################################################")
 
-# Run Frank-Wolfe Optimization
+# Run Frank-Wolfe Optimization with Greedy
 print("\nRunning Frank-Wolfe Optimization with Greedy Solution")
 final_solution, min_eig_val_rounded, i = time_function(
     frank_wolfe_optimization,
@@ -126,7 +134,7 @@ final_solution, min_eig_val_rounded, i = time_function(
     selection_init=selection_vec,
     k=k,
     num_poses=num_poses,
-    num_runs=num_runs,
+    # num_runs=num_runs,
     A=A,
     b=b
 )
@@ -155,38 +163,33 @@ branch_and_bound_solution, branch_and_bound_score = branch_and_bound_with_cuts(
 print("\nBranch-and-Bound with Cuts Solution:", branch_and_bound_solution)
 print("\nBranch-and-Bound with Cuts Score:", branch_and_bound_score)
 
-# # Optional: Evaluate and print minimum eigenvalues for each solution
-# for label, sol in zip(
-#     ["Basic Rounding", "Tie-Breaking Rounding", "Madow's Rounding", "Branch-and-Bound"],
-#     [basic_rounding_solution, rounding_tie_break_solution, madow_rounding_solution, branch_and_bound_solution]
-# ):
-#     min_eig_val = evaluate_solution(inf_mats, H0, sol, num_poses)
-#     print(f"Minimum Eigenvalue for {label} Solution: {min_eig_val}")
-
 print("\n #########################################################################")
 
-# Run Scipy Minimize Optimization
+# Run Scipy Optimization
 print("\nRunning Scipy Minimize Optimization")
-continuous_sol, min_eig_val_unr = time_function(
+continuous_sol_scipy, min_eig_val_scipy = time_function(
     scipy_minimize,
     inf_mats=inf_mats,
     H0=H0,
     selection_init=selection_init,
     k=k,
-    num_poses=num_poses
+    num_poses=num_poses,
+    A=A,
+    b=b
 )
-print("Scipy Minimize Results:", continuous_sol, min_eig_val_unr)
+
+print("Scipy Minimize Results:", continuous_sol_scipy, min_eig_val_scipy)
 
 # Basic Rounding
-basic_rounding_solution = roundsolution(continuous_sol, k)
+basic_rounding_solution = roundsolution(continuous_sol_scipy, k)
 print("\nBasic Rounding Solution:", basic_rounding_solution)
 
 # Rounding with Tie-Breaking (using smallest eigenvalue)
-rounding_tie_break_solution = roundsolution_breakties(continuous_sol, k, inf_mats, H0)
+rounding_tie_break_solution = roundsolution_breakties(continuous_sol_scipy, k, inf_mats, H0)
 print("\nRounding with Tie-Breaking Solution:", rounding_tie_break_solution)
 
 # Madow's Rounding (Probabilistic Rounding)
-madow_rounding_solution = roundsolution_madow(continuous_sol, k)
+madow_rounding_solution = roundsolution_madow(continuous_sol_scipy, k)
 print("\nMadow's Probabilistic Rounding Solution:", madow_rounding_solution)
 
 # Branch-and-Bound with Cuts
@@ -195,18 +198,44 @@ branch_and_bound_solution, branch_and_bound_score = branch_and_bound_with_cuts(
     H0=H0,
     num_poses=num_poses,
     k=k,
-    relaxed_solution=continuous_sol
+    relaxed_solution=continuous_sol_scipy
 )
 print("\nBranch-and-Bound with Cuts Solution:", branch_and_bound_solution)
 print("\nBranch-and-Bound with Cuts Score:", branch_and_bound_score)
 
-# Verification of Constraints and Consistency of Results
-print("\nVerification of Results")
-# # Ensure that the number of selected sensors does not exceed `k`
-# assert np.sum(rounded_sol) <= k, "Scipy Minimize solution violates the 'at most k' constraint."
-# assert np.sum(final_solution) <= k, "Frank-Wolfe solution violates the 'at most k' constraint."
+print("\nRunning Nsopy Optimization")
+selection_nsopy, min_eig_val_nsopy = time_function(
+    nsopy_optimize,
+    inf_mats=inf_mats,
+    H0=H0,
+    selection_init=selection_init,
+    # k=k,
+    num_poses=num_poses,
+    A=A,
+    b=b,
+    # n_iters=n_iters
+)
+print("Nsopy Optimization Results:", selection_nsopy, min_eig_val_nsopy)
 
-# # Compare scores across methods to see if they are consistent
-# print("Best Score from Greedy Selection:", best_score)
-# print("Minimum Eigenvalue (Rounded) from Frank-Wolfe:", min_eig_val_rounded)
-# print("Minimum Eigenvalue (Continuous) from Scipy Minimize:", min_eig_val_unr)
+# **Basic Rounding**
+basic_rounding_solution_nsopy = roundsolution(selection_nsopy, k)
+print("\nBasic Rounding Solution (Nsopy):", basic_rounding_solution_nsopy)
+
+# **Rounding with Tie-Breaking (using smallest eigenvalue)**
+rounding_tie_break_solution_nsopy = roundsolution_breakties(selection_nsopy, k, inf_mats, H0)
+print("\nRounding with Tie-Breaking Solution (Nsopy):", rounding_tie_break_solution_nsopy)
+
+# **Madow's Rounding (Probabilistic Rounding)**
+madow_rounding_solution_nsopy = roundsolution_madow(selection_nsopy, k)
+print("\nMadow's Probabilistic Rounding Solution (Nsopy):", madow_rounding_solution_nsopy)
+
+# **Branch-and-Bound with Cuts**
+branch_and_bound_solution_nsopy, branch_and_bound_score_nsopy = branch_and_bound_with_cuts(
+    inf_mats=inf_mats,
+    H0=H0,
+    num_poses=num_poses,
+    k=k,
+    relaxed_solution=selection_nsopy
+)
+print("\nBranch-and-Bound with Cuts Solution (Nsopy):", branch_and_bound_solution_nsopy)
+print("\nBranch-and-Bound with Cuts Score (Nsopy):", branch_and_bound_score_nsopy)

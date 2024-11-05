@@ -16,6 +16,9 @@ from gtsam.utils import plot
 # from Experiments import exp_utils
 from scipy.optimize import minimize, Bounds
 from numpy import linalg as la
+from nsopy.methods.subgradient import SubgradientMethod
+from nsopy.loggers import GenericDualMethodLogger
+
 
 L = gtsam.symbol_shorthand.L
 X = gtsam.symbol_shorthand.X
@@ -26,51 +29,42 @@ class Metric(Enum):
     MSE = 3
 
 def greedy_selection(
-    inf_mat: np.ndarray,
+    inf_mats: List[np.ndarray],
     prior: np.ndarray,
     Nc: int,
     metric: Metric = Metric.MIN_EIG,
     num_runs: int = 1,
-) -> Tuple[List[int], float, np.ndarray]:
+) -> Tuple[np.ndarray, float, np.ndarray]:
     """
     Greedy selection algorithm to maximize information gain.
-
-    Args:
-        inf_mat: Precomputed information matrix (FIM) for each candidate sensor configuration.
-        prior: Prior information matrix to be added for each selection.
-        Nc: Number of sensors to select.
-        metric: Objective metric to optimize (LOGDET, MIN_EIG, MSE).
-        num_runs: Number of runs or trajectories.
-
-    Returns:
-        best_selection_indices: Indices of the selected sensor configurations.
-        best_score: Score of the best configuration based on the specified metric.
-        avail_cand: Array indicating availability of candidates after selection.
     """
     best_selection_indices = []
-    best_score = 0.0
-    avail_cand = np.ones(len(inf_mat), dtype=int)
+    best_score = float('-inf')
+    avail_cand = np.ones(len(inf_mats), dtype=int)
 
     # Run the greedy selection for each trajectory/run
     for run in range(num_runs):
         for i in range(Nc):
-            max_inf = 0.0
+            max_inf = float('-inf')
             selected_cand = None
 
             # Iterate through each available candidate
-            for j in range(len(inf_mat)):
+            for j in range(len(inf_mats)):
                 if avail_cand[j] == 1:
                     # Build the full information matrix with prior
-                    candidate_fim = inf_mat[j] + prior
+                    candidate_fim = prior.copy()
+                    for idx in best_selection_indices + [j]:
+                        candidate_fim += inf_mats[idx]
 
                     # Calculate objective score based on metric
                     if metric == Metric.LOGDET:
-                        sign, score = np.linalg.slogdet(candidate_fim)
-                        score *= sign
+                        sign, logdet = np.linalg.slogdet(candidate_fim)
+                        score = sign * logdet
                     elif metric == Metric.MIN_EIG:
-                        score = np.linalg.eigvalsh(candidate_fim)[0]
+                        eigvals = np.linalg.eigvalsh(candidate_fim)
+                        score = eigvals[0]  # Smallest eigenvalue
                     else:  # Metric.MSE
-                        score = np.trace(np.linalg.inv(candidate_fim))
+                        score = -np.trace(np.linalg.pinv(candidate_fim))
 
                     # Update the best candidate if the score is higher
                     if score > max_inf:
@@ -87,7 +81,7 @@ def greedy_selection(
 
     print("Selected candidates are:", best_selection_indices)
 
-    selection_vector = np.zeros(len(inf_mat))
+    selection_vector = np.zeros(len(inf_mats))
     selection_vector[best_selection_indices] = 1
     return selection_vector, best_score, avail_cand
 
@@ -99,65 +93,80 @@ def frank_wolfe_optimization(
     selection_init: np.ndarray,
     k: int,
     num_poses: int,
-    num_runs: int,
     A: np.ndarray,
     b: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, float, float, int]:
+) -> Tuple[np.ndarray, float, int]:
     """
-    Frank-Wolfe optimization method with constraints for multiple runs, without rounding the final solution.
+    Frank-Wolfe optimization method with constraints.
 
     Args:
-        inf_mats: Information matrices for each trajectory.
+        inf_mats: List of information matrices for each sensor.
         prior: Prior information matrix.
         n_iters: Number of iterations.
-        selection_init: Initial selection of sensors.
+        selection_init: Initial selection vector.
         k: Number of sensors to select.
         num_poses: Number of poses.
-        num_runs: Number of trajectories.
         A: Constraint matrix.
         b: Constraint vector.
 
     Returns:
         selection_cur: Final continuous sensor selection.
-        min_eig_val_rounded: Minimum eigenvalue for the solution constrained to k sensors.
-        min_eig_val_unrounded: Minimum eigenvalue for the continuous solution.
-        i: Final iteration count.
+        min_eig_val_score: Minimum eigenvalue score of the final solution.
+        num_iterations: Number of iterations performed.
     """
-    selection_cur = selection_init
-    prev_min_eig_score = 0
-
+    selection_cur = selection_init.copy()
+    num_sensors = len(selection_cur)
     for i in range(n_iters):
-        grad = np.zeros(selection_cur.shape)
-        min_eig_val_score = 0.0
+        # Compute the gradient at the current selection
+        min_eig_val, min_eig_vec, final_inf_mat = infmat.find_min_eig_pair(
+            inf_mats, selection_cur, prior, num_poses
+        )
 
-        for traj_ind in range(num_runs):
-            min_eig_val, min_eig_vec, final_inf_mat = infmat.find_min_eig_pair(
-                inf_mats[traj_ind], selection_cur, prior, num_poses
-            )
-            min_eig_val_score += min_eig_val
-            Hxx = final_inf_mat[-num_poses * 6:, -num_poses * 6:]
-            Hll = final_inf_mat[0: -num_poses * 6, 0: -num_poses * 6]
-            Hlx = final_inf_mat[0: -num_poses * 6, -num_poses * 6:]
+        # Gradient computation
+        grad = np.zeros_like(selection_cur)
+        for idx in range(num_sensors):
+            Hi = inf_mats[idx]
+            grad[idx] = -min_eig_vec.T @ Hi @ min_eig_vec  # Negative because we minimize
 
-            for ind in range(selection_cur.shape[0]):
-                Hc = inf_mats[traj_ind][ind]
-                grad_schur = Hxx - (Hlx.T @ np.linalg.pinv(Hll) @ Hlx) + Hc
-                grad[ind] += min_eig_vec.T @ grad_schur @ min_eig_vec
+        # Solve the linear minimization oracle (LMO)
+        c = grad  # Minimize c^T x
+        # Include the equality constraint sum(x) = k
+        A_eq = np.ones((1, num_sensors))
+        b_eq = np.array([k])
+        bounds = [(0, 1) for _ in range(num_sensors)]
+        res = linprog(c=c, A_ub=A, b_ub=b, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
 
-        result = linprog(c=-grad, A_ub=A, b_ub=b, bounds=(0, 1), method='highs')
-        rounded_sol = result.x
-
-        # Stopping criterion
-        if abs(min_eig_val_score - prev_min_eig_score) < 1e-5:
+        if res.status != 0:
+            print(f"Linprog failed at iteration {i}, status {res.status}: {res.message}")
             break
 
-        # Step size and update
-        alpha = 1.0 / (i + 10.0)
+        s = res.x  # Direction from LMO
 
-        prev_min_eig_score = min_eig_val_score
-        selection_cur = selection_cur + alpha * (rounded_sol - selection_cur)
+        # Compute step size (line search)
+        delta_x = s - selection_cur
+        numerator = -grad @ delta_x
+        denominator = np.linalg.norm(infmat.combine_inf_mats(inf_mats, delta_x)) ** 2
+        if denominator == 0:
+            alpha = 0
+        else:
+            alpha = min(1, numerator / denominator)
+            alpha = max(0, alpha)  
 
-    return selection_cur, min_eig_val_score, i
+        # Update the current selection
+        selection_cur = selection_cur + alpha * delta_x
+
+        # Stopping criterion based on the duality gap
+        duality_gap = -grad @ delta_x
+        if duality_gap < 1e-2:
+            print(f"Converged at iteration {i}, duality gap: {duality_gap}")
+            break
+
+    # Compute the final minimum eigenvalue score
+    min_eig_val_score, _, _ = infmat.find_min_eig_pair(
+        inf_mats, selection_cur, prior, num_poses
+    )
+
+    return selection_cur, min_eig_val_score, i + 1
 
 def roundsolution(selection, k):
     """
@@ -374,53 +383,68 @@ Scipy optimization methods
 # Not poses - dimensions
 def min_eig_obj_with_jac(x, inf_mats, H0, num_poses):
     """
-    Objective function for maximizing the smallest eigenvalue with respect to sensor selection.
-    This function computes the minimum eigenvalue of the information matrix (FIM) and its gradient
-    for optimization. It’s used as the objective function for `scipy_minimize`.
+    Computes the objective function and its Jacobian (gradient) for use with scipy.optimize.minimize.
+    The objective is the negative of the smallest eigenvalue of the information matrix.
 
     Args:
-        x (np.ndarray): Continuous selection vector for sensors.
-        inf_mats (List[np.ndarray]): List of information matrices for each candidate sensor configuration.
+        x (np.ndarray): Continuous selection vector.
+        inf_mats (List[np.ndarray]): List of information matrices for each sensor.
         H0 (np.ndarray): Prior information matrix.
-        num_poses (int): Number of poses in the problem.
+        num_poses (int): Number of poses.
 
     Returns:
-        Tuple[float, np.ndarray]: The negative minimum eigenvalue (objective value) and its gradient.
+        Tuple[float, np.ndarray]: The objective function value and its gradient with respect to x.
     """
-    # Compute the minimum eigenvalue and eigenvector for the given selection vector x
-    min_eig_val, min_eig_vec, final_inf_mat = infmat.find_min_eig_pair(inf_mats, x, H0, num_poses)
-    
-    # Initialize the gradient
-    grad = np.zeros(x.shape)
-    
-    # Compute the Schur complement gradient components
-    Hxx = final_inf_mat[-num_poses * 6:, -num_poses * 6:]
-    Hll = final_inf_mat[0: -num_poses * 6, 0: -num_poses * 6:]
-    Hlx = final_inf_mat[0: -num_poses * 6, -num_poses * 6:]
-    
-    for ind in range(x.shape[0]):
-        Hc = inf_mats[ind]
-        Hxx_c = Hc[-num_poses * 6:, -num_poses * 6:]
-        Hll_c = Hc[0: -num_poses * 6, 0: -num_poses * 6:]
-        Hlx_c = Hc[0: -num_poses * 6, -num_poses * 6:]
-        
-        # Compute the Schur complement gradient
-        t0 = Hlx.T
-        t1 = np.linalg.pinv(Hll)
-        t2 = t0 @ t1
-        grad_schur = Hxx_c - (Hlx_c.T @ t1 @ t0.T - t2 @ Hll_c @ t1 @ t0.T + t2 @ Hlx_c)
-        
-        # Update the gradient with respect to the minimum eigenvalue direction
-        grad[ind] = min_eig_vec.T @ grad_schur @ min_eig_vec
+    # Build the combined information matrix based on the selected sensors
+    combined_fim = H0.copy()
+    for xi, Hi in zip(x, inf_mats):
+        combined_fim += xi * Hi
 
-    return -1.0 * min_eig_val, -1.0 * grad
+    # Compute eigenvalues and eigenvectors
+    eigvals, eigvecs = np.linalg.eigh(combined_fim)
+    min_eig_index = np.argmin(eigvals)
+    min_eig_val = eigvals[min_eig_index]
+    min_eig_vec = eigvecs[:, min_eig_index]
 
+    # Objective function value (negative smallest eigenvalue)
+    f = -min_eig_val
 
-def scipy_minimize(inf_mats, H0, selection_init, k, num_poses):
+    # Extract submatrices based on the correct dimensions
+    pose_dim = 6  # Assuming each pose contributes 6 dimensions
+    num_pose_elements = num_poses * pose_dim
+    total_size = combined_fim.shape[0]
+    measurement_dim = total_size - num_pose_elements
+
+    Hxx = combined_fim[-num_pose_elements:, -num_pose_elements:]
+    Hll = combined_fim[:measurement_dim, :measurement_dim]
+    Hlx = combined_fim[:measurement_dim, -num_pose_elements:]
+
+    # Compute the inverse of Hll (ensure it's invertible)
+    Hll_inv = np.linalg.inv(Hll)
+
+    # Compute the Schur complement
+    H_schur = Hxx - Hlx.T @ Hll_inv @ Hlx
+
+    # Compute the gradient
+    grad = np.zeros_like(x)
+    for idx, Hi in enumerate(inf_mats):
+        # Split Hi into submatrices
+        Hxx_i = Hi[-num_pose_elements:, -num_pose_elements:]
+        Hll_i = Hi[:measurement_dim, :measurement_dim]
+        Hlx_i = Hi[:measurement_dim, -num_pose_elements:]
+
+        # Compute the Schur complement of Hi
+        H_schur_i = Hxx_i - Hlx_i.T @ np.linalg.inv(Hll_i) @ Hlx_i
+
+        # Gradient component
+        grad[idx] = -min_eig_vec.T @ H_schur_i @ min_eig_vec
+
+    return f, grad
+
+def scipy_minimize(inf_mats, H0, selection_init, k, num_poses, A, b):
     """
-    Uses `scipy.optimize.minimize` to solve a constrained optimization problem for selecting sensors.
-    The objective is to minimize the smallest eigenvalue of the FIM by selecting an optimal subset of sensors.
-    This method explicitly enforces constraints on the number of selected sensors.
+    Uses `scipy.optimize.minimize` with inequality constraints to solve a sensor selection problem.
+    The objective is to maximize the smallest eigenvalue of the FIM.
 
     Args:
         inf_mats (List[np.ndarray]): List of information matrices for each candidate sensor configuration.
@@ -428,33 +452,109 @@ def scipy_minimize(inf_mats, H0, selection_init, k, num_poses):
         selection_init (np.ndarray): Initial continuous selection vector.
         k (int): Exact number of sensors to select.
         num_poses (int): Number of poses in the problem.
+        A (np.ndarray): Matrix defining inequality constraints.
+        b (np.ndarray): Vector defining inequality constraints.
 
     Returns:
-        Tuple[np.ndarray, np.ndarray, float, float]: The rounded solution, continuous solution,
-                                                     minimum eigenvalues for rounded and unrounded solutions.
+        Tuple[np.ndarray, float]: Continuous solution vector, maximum minimum eigenvalue.
     """
     # Set bounds for each variable in x (between 0 and 1) to represent selection probabilities
-    bounds = tuple([(0, 1) for _ in range(selection_init.shape[0])])
-    
-    cons = (
-        {'type': 'eq', 'fun': lambda x: np.sum(x) - k}
-    )
-    
-    # Run the constrained optimization using the `trust-constr` method, passing the objective and gradient
+    bounds = [(0, 1) for _ in range(selection_init.shape[0])]
+
+    # Define constraints to include both the sum constraint and inequality constraints
+    cons = [
+        {'type': 'eq', 'fun': lambda x: np.sum(x) - k},  # Sum constraint
+        {'type': 'ineq', 'fun': lambda x: b - A @ x}     # Inequality constraints Ax <= b
+    ]
+
+    # Optimization function that maximizes the smallest eigenvalue
     res = minimize(
-        min_eig_obj_with_jac, 
-        selection_init, 
-        method='trust-constr', 
-        jac=True, 
-        args=(inf_mats, H0, num_poses),
-        constraints=cons, 
-        bounds=bounds, 
+        fun=lambda x: min_eig_obj_with_jac(x, inf_mats, H0, num_poses),
+        x0=selection_init,
+        method='trust-constr',
+        jac=True,
+        constraints=cons,
+        bounds=bounds,
         options={'disp': True}
     )
-    
-    # Print the continuous solution from the optimization
-    print("Continuous solution from optimization:", res.x)
-    
-    # Calculate minimum eigenvalues for both the continuous (`res.x`)
-    min_eig_val_unr, _, _ = infmat.find_min_eig_pair(inf_mats, res.x, H0, num_poses)    
+
+    # Get the minimum eigenvalue of the continuous solution
+    min_eig_val_unr, _, _ = infmat.find_min_eig_pair(inf_mats, res.x, H0, num_poses)
+
     return res.x, min_eig_val_unr
+
+'''
+################################################################
+NSOPy optimization methods
+'''
+
+def nsopy_optimize(inf_mats, H0, selection_init, num_poses, k, max_iters=100):
+
+
+    def min_eig_oracle(lambda_k):
+        x_k = lambda_k  # Primal variable
+
+        # Compute the combined information matrix
+        combined_inf_mat = H0.copy()
+        for xi, Hi in zip(x_k, inf_mats):
+            combined_inf_mat += xi * Hi
+
+        # Compute the smallest eigenvalue and corresponding eigenvector
+        eigvals, eigvecs = np.linalg.eigh(combined_inf_mat)
+        min_eig_index = np.argmin(eigvals)
+        smallest_eigval = eigvals[min_eig_index]
+        corresponding_eigvec = eigvecs[:, min_eig_index]
+
+        # Compute the subgradient
+        subgradient = np.array([
+            corresponding_eigvec.T @ Hi @ corresponding_eigvec for Hi in inf_mats
+        ])
+
+        d_k = smallest_eigval  # Dual function value
+
+        return x_k, d_k, subgradient
+
+    def projection_onto_simplex(v, s):
+        n = len(v)
+        v_sorted = np.sort(v)[::-1]
+        cssv = np.cumsum(v_sorted)
+        rho = np.nonzero(v_sorted + (s - cssv) / np.arange(1, n+1) > 0)[0][-1]
+        theta = (cssv[rho] - s) / (rho + 1.0)
+        w = np.maximum(v - theta, 0)
+        return w
+
+    def projection_function(x_k):
+        # Project onto the simplex defined by sum(x_k) = k and x_k >= 0
+        x_projected = projection_onto_simplex(x_k, s=k)
+        return x_projected
+
+    # Initialize the method
+    method = SubgradientMethod(
+        oracle=min_eig_oracle,
+        projection_function=projection_function,
+        stepsize_0=0.1,
+        stepsize_rule='1/sqrt(k)',
+        sense='min',
+        dimension=len(selection_init)
+    )
+
+    # Use a feasible initial point
+    selection_init = projection_onto_simplex(selection_init, s=k)
+    method.lambda_k = selection_init.copy()
+
+    logger = GenericDualMethodLogger(method)
+
+    for iteration in range(max_iters):
+        method.step()
+        current_selection = method.lambda_k
+        current_objective = logger.d_k_iterates[-1]  # Minimization problem
+        print(f"Iteration {iteration + 1}: Objective Value = {current_objective}")
+
+        # Stopping criterion
+        if iteration > 0 and abs(logger.d_k_iterates[-1] - logger.d_k_iterates[-2]) < 1e-5:
+            print(f"Converged at iteration {iteration + 1}")
+            break
+
+    final_selection = method.lambda_k
+    final_objective = logger.d_k_iterates[-1]
+    return final_selection, final_objective
