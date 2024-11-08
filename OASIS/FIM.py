@@ -523,6 +523,9 @@ def find_min_eig_pair(inf_mats, selection, H0, num_poses):
     inds = np.where(selection > 1e-10)[0]
     final_inf_mat = sum(selection[i] * inf_mats[i] for i in inds) + H0
     H_schur = compute_schur_fim(final_inf_mat, num_poses)
+    eigvals = np.linalg.eigvalsh(H_schur)
+    # print("Min eig of the Schur complement:", eigvals.min())
+
     assert utilities.check_symmetric(H_schur)
     eigvals, eigvecs = la.eigh(H_schur)
     return eigvals[0], eigvecs[:, 0], final_inf_mat
