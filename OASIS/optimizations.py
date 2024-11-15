@@ -477,7 +477,7 @@ def min_eig_obj_lse_with_jac(x, inf_mats, H0, num_poses):
 
     # Compute all eigenvalues and eigenvectors of H_schur
     eigvals, eigvecs = np.linalg.eigh(H_schur)
-    beta = 10.0  # Parameter for the LSE approximation
+    beta = 5.0 
 
     # Stabilize weights computation using Log-Sum-Exp trick
     eigvals_shifted = eigvals - eigvals.min()  # Shift to prevent underflow
@@ -549,7 +549,7 @@ def scipy_minimize_lse(inf_mats, H0, selection_init, num_poses, A, b):
         jac=True,
         constraints=cons,
         bounds=bounds,
-        options={'disp': False, 'maxiter': 1000, 'ftol': 1e-9}
+        options={'disp': False, 'maxiter': 1000, 'ftol': 1e-6}
     )
 
     # Get the approximated minimum eigenvalue of the continuous solution

@@ -37,7 +37,7 @@ def generate_random_fim(num_matrices, matrix_size):
 
         # Calculate and print the minimum eigenvalue
         min_eig_val = np.min(eigenvalues)
-        print(f"Matrix {i + 1}: Minimum eigenvalue = {min_eig_val:.4f}")
+        # print(f"Matrix {i + 1}: Minimum eigenvalue = {min_eig_val:.4f}")
 
     return inf_mats
 
@@ -59,7 +59,7 @@ def run_tests():
     num_poses = 6
 
     # Define the list of num_matrices to test
-    num_matrices_list = [10, 100, 1000]
+    num_matrices_list = [10, 100]
 
     # Initialize a list to store the results
     results = []
