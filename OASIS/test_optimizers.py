@@ -166,9 +166,9 @@ def run_tests():
             )
             if num_matrices == 10:
                 print("Scipy Optimization with Smoothing Results (selection vector):", selection_scipy_lse)
-                print("Scipy Minimize LSE Results (K - max):", roundsolution(continuous_sol_scipy, k))
-                print("Scipy Minimize LSE Results (Breakties):", roundsolution_breakties(continuous_sol_scipy, k, inf_mats, H0))
-                print("Scipy Minimize LSE Results (Madow):", roundsolution_madow(continuous_sol_scipy, k))
+                print("Scipy Minimize LSE Results (K - max):", roundsolution(selection_scipy_lse, k))
+                print("Scipy Minimize LSE Results (Breakties):", roundsolution_breakties(selection_scipy_lse, k, inf_mats, H0))
+                print("Scipy Minimize LSE Results (Madow):", roundsolution_madow(selection_scipy_lse, k))
                 selection_vector = selection_scipy_lse.tolist()
             else:
                 selection_vector = None
@@ -200,6 +200,9 @@ def run_tests():
                 )
                 if num_matrices == 10:
                     print("Frank-Wolfe Optimization Results (selection vector):", final_solution)
+                    print("Frank-Wolfe Optimization Results (K - max):", roundsolution(final_solution, k))
+                    print("Frank-Wolfe Optimization Results (Breakties):", roundsolution_breakties(final_solution, k, inf_mats, H0))
+                    print("Frank-Wolfe Optimization Results (Madow):", roundsolution_madow(final_solution, k))
                     selection_vector = final_solution.tolist()
                 else:
                     selection_vector = None
@@ -223,11 +226,7 @@ def run_tests():
             # Append the test case result to the results list
             results.append(test_case_result)
 
-    # Save results to a YAML file
-    with open('optimization_results.yaml', 'w') as yaml_file:
-        yaml.dump(results, yaml_file)
-
-    print("\nTesting complete. Results saved to 'optimization_results.yaml'.")
+    print("\nTesting complete.")
 
 if __name__ == "__main__":
     run_tests()
