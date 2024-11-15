@@ -6,12 +6,10 @@ from enum import Enum
 from enum import Enum
 import utilities
 import FIM as infmat
-import visualize
 import numpy as np
 import matplotlib.pyplot as plt
 from functools import partial
 from typing import List, Optional
-import time
 from gtsam.utils import plot
 # from Experiments import exp_utils
 from scipy.optimize import minimize, Bounds
@@ -77,141 +75,97 @@ def greedy_selection(
     return selection_vector, best_score, avail_cand
 
 
-# def frank_wolfe_optimization(
-#     inf_mats: List[np.ndarray],
-#     prior: np.ndarray,
-#     n_iters: int,
-#     selection_init: np.ndarray,
-#     k: int,
-#     num_poses: int,
-#     A: np.ndarray,
-#     b: np.ndarray
-# ) -> Tuple[np.ndarray, float, int]:
-#     """
-#     Frank-Wolfe optimization method with constraints using a smooth approximation.
+def solve_lmo(grad, A, b, k):
+    num_sensors = len(grad)
+    c = grad
+    bounds = [(0, 1) for _ in range(num_sensors)]
+    A_eq = [np.ones(num_sensors)]
+    b_eq = [k]
+    res = linprog(c, A_ub=A, b_ub=b, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
+    if res.success:
+        return res.x
+    else:
+        print("LMO failed to find a feasible solution.")
+        return None
 
-#     Args:
-#         inf_mats: List of information matrices for each sensor.
-#         prior: Prior information matrix.
-#         n_iters: Number of iterations.
-#         selection_init: Initial selection vector.
-#         k: Number of sensors to select.
-#         num_poses: Number of poses.
-#         A: Inequality constraint matrix.
-#         b: Inequality constraint vector.
+def frank_wolfe_optimization(
+    inf_mats: List[np.ndarray],
+    prior: np.ndarray,
+    n_iters: int,
+    selection_init: np.ndarray,
+    k: int,
+    num_poses: int,
+    A: np.ndarray,
+    b: np.ndarray
+) -> Tuple[np.ndarray, float, int]:
+    selection_cur = selection_init.copy()
+    num_sensors = len(selection_cur)
+    prev_min_eig = float('inf')
 
-#     Returns:
-#         selection_cur: Final continuous sensor selection.
-#         approx_min_eig_val: Approximated minimum eigenvalue score of the final solution.
-#         num_iterations: Number of iterations performed.
-#     """
-#     selection_cur = selection_init.copy()
-#     num_sensors = len(selection_cur)
-#     beta = 100.0  # Smoothing parameter for Log-Sum-Exp approximation
+    for iteration in range(n_iters):
+        # Compute the minimum eigenvalue and eigenvector
+        min_eig_val, min_eig_vec, final_inf_mat = infmat.find_min_eig_pair(
+            inf_mats, selection_cur, prior, num_poses
+        )
 
-#     for iteration in range(n_iters):
-#         # Compute the combined information matrix H(x)
-#         combined_inf_mat = prior.copy()
-#         for xi, Hi in zip(selection_cur, inf_mats):
-#             combined_inf_mat += xi * Hi
+        # Compute the gradient
+        grad = np.zeros(num_sensors)
+        # Adjust slicing
+        total_size = final_inf_mat.shape[0]
+        pose_dim = 6  # Adjust as needed
+        expected_pose_elements = num_poses * pose_dim
+        measurement_dim = total_size - expected_pose_elements
 
-#         # Extract submatrices for Schur complement
-#         pose_dim = 6  # Adjust as needed
-#         num_pose_elements = num_poses * pose_dim
-#         total_size = combined_inf_mat.shape[0]
-#         measurement_dim = total_size - num_pose_elements
+        Hll = final_inf_mat[:measurement_dim, :measurement_dim]
+        Hlx = final_inf_mat[:measurement_dim, measurement_dim:]
+        Hxx = final_inf_mat[measurement_dim:, measurement_dim:]
 
-#         Hll = combined_inf_mat[:measurement_dim, :measurement_dim]
-#         Hlx = combined_inf_mat[:measurement_dim, measurement_dim:]
-#         Hxx = combined_inf_mat[measurement_dim:, measurement_dim:]
+        Hll_inv = np.linalg.pinv(Hll)
 
-#         # Compute Schur complement H_schur = Hxx - Hlx.T @ Hll_inv @ Hlx
-#         try:
-#             Hll_inv = np.linalg.inv(Hll)
-#         except np.linalg.LinAlgError:
-#             Hll_inv = np.linalg.pinv(Hll)
-#             print("Warning: Hll is singular; using pseudoinverse.")
+        t0 = Hlx.T
+        t1 = Hll_inv
+        t2 = t0 @ t1
 
-#         H_schur = Hxx - Hlx.T @ Hll_inv @ Hlx
-#         # Ensure H_schur is symmetric
-#         H_schur = (H_schur + H_schur.T) / 2
+        for idx in range(num_sensors):
+            Hc = inf_mats[idx]
+            Hll_c = Hc[:measurement_dim, :measurement_dim]
+            Hlx_c = Hc[:measurement_dim, measurement_dim:]
+            Hxx_c = Hc[measurement_dim:, measurement_dim:]
 
-#         # Compute all eigenvalues and eigenvectors of H_schur
-#         eigvals, eigvecs = np.linalg.eigh(H_schur)
+            grad_schur = Hxx_c - (
+                Hlx_c.T @ Hll_inv @ Hlx
+                - t2 @ Hll_c @ Hll_inv @ Hlx
+                + t2 @ Hlx_c
+            )
+            grad[idx] = -min_eig_vec.T @ grad_schur @ min_eig_vec
 
-#         # Compute the objective function using the Log-Sum-Exp approximation
-#         eigvals_shifted = eigvals - eigvals.min()
-#         weights = np.exp(-beta * eigvals_shifted)
-#         weight_sum = np.sum(weights)
-#         f = (-1 / beta) * np.log(weight_sum) + eigvals.min()
+        # Solve the LMO
+        s = solve_lmo(grad, A, b, k)
+        if s is None:
+            print("LMO failed to find a feasible solution.")
+            break
 
-#         # Compute the gradient
-#         grad = np.zeros(num_sensors)
-#         for idx, Hi in enumerate(inf_mats):
-#             # Build the combined information matrix derivative
-#             Hi_combined = Hi
+        # Step size
+        alpha = 1.0 / (iteration + 2.0)
 
-#             # Compute the derivative of H_schur with respect to x_i
-#             Hi_ll = Hi_combined[:measurement_dim, :measurement_dim]
-#             Hi_lx = Hi_combined[:measurement_dim, measurement_dim:]
-#             Hi_xx = Hi_combined[measurement_dim:, measurement_dim:]
+        # Update the current selection
+        selection_cur = selection_cur + alpha * (s - selection_cur)
 
-#             try:
-#                 Hi_ll_inv = np.linalg.inv(Hi_ll)
-#             except np.linalg.LinAlgError:
-#                 Hi_ll_inv = np.linalg.pinv(Hi_ll)
-#                 print(f"Warning: Hi_ll is singular at index {idx}; using pseudoinverse.")
+        # Check for convergence
+        if abs(min_eig_val - prev_min_eig) < 1e-7:
+            print(f"Converged at iteration {iteration}")
+            break
+        prev_min_eig = min_eig_val
 
-#             H_schur_i = Hi_xx - Hi_lx.T @ Hll_inv @ Hlx - Hlx.T @ Hi_ll_inv @ Hlx - Hlx.T @ Hll_inv @ Hi_lx
-#             # Ensure H_schur_i is symmetric
-#             H_schur_i = (H_schur_i + H_schur_i.T) / 2
-
-#             # Compute derivative of eigenvalues with respect to x_i
-#             lambda_derivatives = np.array([
-#                 eigvecs[:, i].T @ H_schur_i @ eigvecs[:, i]
-#                 for i in range(len(eigvals))
-#             ])
-
-#             # Compute gradient component
-#             grad[idx] = np.sum(weights * lambda_derivatives) / weight_sum
-
-#         # Create an array of indices sorted by ascending grad values
-#         sorted_indices = np.argsort(grad)
-
-#         s = np.zeros(num_sensors)
-#         remaining_k = k
-#         # Initialize s to zeros
-#         s[:] = 0
-#         # Assign ones to variables with the smallest gradient values until the sum constraint is met
-#         for idx in sorted_indices:
-#             if remaining_k <= 0:
-#                 break
-#             # Check inequality constraints A s <= b
-#             s_temp = s.copy()
-#             s_temp[idx] = 1
-#             if np.all(A @ s_temp <= b):
-#                 s[idx] = 1
-#                 remaining_k -= 1
-
-#         # Compute the step size
-#         # Standard Frank-Wolfe step size: alpha = 2 / (iteration + 2)
-#         alpha = 2 / (iteration + 2)
-
-#         # Update the current selection
-#         selection_cur = (1 - alpha) * selection_cur + alpha * s
-
-#         # Compute the duality gap
-#         duality_gap = grad @ (selection_cur - s)
-
-#         # Stopping criterion based on the duality gap
-#         if duality_gap < 1e-6:
-#             print(f"Converged at iteration {iteration}, duality gap: {duality_gap}")
-#             break
-
-#     # Compute the final approximated minimum eigenvalue score
-#     approx_min_eig_val = f
-
-#     return selection_cur, approx_min_eig_val, iteration + 1
+    # Final solution
+    final_solution = selection_cur.copy()
+    min_eig_val_unrounded, _, _ = infmat.find_min_eig_pair(
+        inf_mats, selection_cur, prior, num_poses
+    )
+    min_eig_val, _, _ = infmat.find_min_eig_pair(
+        inf_mats, final_solution, prior, num_poses
+    )
+    return selection_cur, min_eig_val, iteration + 1
 
 def roundsolution(selection, k):
     """
@@ -324,7 +278,7 @@ def branch_and_bound_with_cuts(
         fractional_cut_ratio (float): Fractional value ratio for applying cuts (e.g., 0.3 for 30%).
 
     Returns:
-        Tuple[np.ndarray, float]: The best binary selection solution and its score.
+        Tuple[np.ndarray, float]: The best binary selection solution and its sinfmat.
     """
 
     # Round the relaxed solution to get an initial feasible solution at the root depth
@@ -425,11 +379,10 @@ def evaluate_solution(inf_mats, H0, solution, num_poses):
 ################################################################
 Scipy optimization methods
 '''
-# Not poses - dimensions
 def min_eig_obj_with_jac(x, inf_mats, H0, num_poses):
     """
     Computes the objective function and its Jacobian (gradient) for use with scipy.optimize.minimize.
-    The objective is the negative of the smallest eigenvalue of the information matrix.
+    The objective is the negative of the smallest eigenvalue of the Schur complement of the information matrix.
 
     Args:
         x (np.ndarray): Continuous selection vector.
@@ -441,49 +394,60 @@ def min_eig_obj_with_jac(x, inf_mats, H0, num_poses):
         Tuple[float, np.ndarray]: The objective function value and its gradient with respect to x.
     """
 
-    # Build the combined information matrix based on the selected sensors
     combined_fim = H0.copy()
     for xi, Hi in zip(x, inf_mats):
         combined_fim += xi * Hi
 
-    # Compute eigenvalues and eigenvectors
-    eigvals, eigvecs = np.linalg.eigh(combined_fim)
-    min_eig_index = np.argmin(eigvals)
-    min_eig_val = eigvals[min_eig_index]
-    min_eig_vec = eigvecs[:, min_eig_index]
-
-    # Objective function value (negative smallest eigenvalue)
-    f = -min_eig_val
-
     # Extract submatrices based on the correct dimensions
-    pose_dim = 6 
+    pose_dim = 6
     num_pose_elements = num_poses * pose_dim
     total_size = combined_fim.shape[0]
     measurement_dim = total_size - num_pose_elements
 
-    Hxx = combined_fim[-num_pose_elements:, -num_pose_elements:]
     Hll = combined_fim[:measurement_dim, :measurement_dim]
-    Hlx = combined_fim[:measurement_dim, -num_pose_elements:]
+    Hlx = combined_fim[:measurement_dim, measurement_dim:]
+    Hxx = combined_fim[measurement_dim:, measurement_dim:]
 
-    # Compute the inverse of Hll (ensure it's invertible)
-    Hll_inv = np.linalg.inv(Hll)
+    # Compute the inverse or pseudoinverse of Hll
+    try:
+        Hll_inv = np.linalg.inv(Hll)
+    except np.linalg.LinAlgError:
+        Hll_inv = np.linalg.pinv(Hll)
 
     # Compute the Schur complement
     H_schur = Hxx - Hlx.T @ Hll_inv @ Hlx
 
+    # Compute eigenvalues and eigenvectors of H_schur
+    eigvals, eigvecs = np.linalg.eigh(H_schur)
+    min_eig_index = np.argmin(eigvals)
+    min_eig_val = eigvals[min_eig_index]
+    min_eig_vec = eigvecs[:, min_eig_index]  # Shape: (num_pose_elements,)
+
+    # Objective function value (negative smallest eigenvalue)
+    f = -min_eig_val
+
+    # Precompute constants
+    t0 = Hlx.T
+    t1 = Hll_inv
+    t2 = t0 @ t1
+
     # Compute the gradient
     grad = np.zeros_like(x)
     for idx, Hi in enumerate(inf_mats):
-        # Split Hi into submatrices
-        Hxx_i = Hi[-num_pose_elements:, -num_pose_elements:]
+        # Corrected submatrix extraction
         Hll_i = Hi[:measurement_dim, :measurement_dim]
-        Hlx_i = Hi[:measurement_dim, -num_pose_elements:]
+        Hlx_i = Hi[:measurement_dim, measurement_dim:]
+        Hxx_i = Hi[measurement_dim:, measurement_dim:]
 
-        # Compute the Schur complement of Hi
-        H_schur_i = Hxx_i - Hlx_i.T @ np.linalg.inv(Hll_i) @ Hlx_i
+        # Compute grad_schur using the same formula as in Frank-Wolfe
+        grad_schur = Hxx_i - (
+            Hlx_i.T @ Hll_inv @ Hlx
+            - t2 @ Hll_i @ Hll_inv @ Hlx
+            + t2 @ Hlx_i
+        )
 
-        # Gradient component
-        grad[idx] = -min_eig_vec.T @ H_schur_i @ min_eig_vec
+        # Gradient component using the pose eigenvector
+        grad[idx] = -min_eig_vec.T @ grad_schur @ min_eig_vec
 
     return f, grad
 
@@ -576,7 +540,7 @@ def min_eig_obj_lse_with_jac(x, inf_mats, H0, num_poses):
 
     # Compute all eigenvalues and eigenvectors of H_schur
     eigvals, eigvecs = np.linalg.eigh(H_schur)
-    beta = 500.0  # Parameter for the LSE approximation
+    beta = 10.0  # Parameter for the LSE approximation
 
     # Stabilize weights computation using Log-Sum-Exp trick
     eigvals_shifted = eigvals - eigvals.min()  # Shift to prevent underflow
@@ -614,7 +578,6 @@ def min_eig_obj_lse_with_jac(x, inf_mats, H0, num_poses):
         # Compute gradient component using softmax weights
         grad[idx] = np.sum(softmax_weights * lambda_derivatives)
 
-    # Since we are maximizing the approximated minimum eigenvalue, return negative values
     return -f, -grad
 
 def scipy_minimize_lse(inf_mats, H0, selection_init, num_poses, A, b):
