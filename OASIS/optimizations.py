@@ -282,7 +282,7 @@ def roundsolution_madow(selection, k):
                     continue
                 rounded_sol[j] = 1
                 break
-    print("Number of candidates selected after rounding:", np.sum(rounded_sol))
+    # print("Number of candidates selected after rounding:", np.sum(rounded_sol))
     return rounded_sol
 
 def evaluate_solution(inf_mats, H0, solution, num_poses):

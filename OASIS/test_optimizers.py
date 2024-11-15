@@ -136,13 +136,14 @@ def run_tests():
             )
             if num_matrices == 10:
                 print("Scipy Minimize Results (selection vector):", continuous_sol_scipy)
+                print("Scipy Minimize Best Score:", min_eig_val_scipy)
                 print("Scipy Minimize Results (K - max):", roundsolution(continuous_sol_scipy, k))
                 print("Scipy Minimize Results (Breakties):", roundsolution_breakties(continuous_sol_scipy, k, inf_mats, H0))
                 print("Scipy Minimize Results (Madow):", roundsolution_madow(continuous_sol_scipy, k))
                 selection_vector = continuous_sol_scipy.tolist()
             else:
                 selection_vector = None
-            print("Scipy Minimize Best Score:", min_eig_val_scipy)
+                print("Scipy Minimize Best Score:", min_eig_val_scipy)
 
             # Store results
             test_case_result['results']['Scipy Minimize'] = {
@@ -166,13 +167,14 @@ def run_tests():
             )
             if num_matrices == 10:
                 print("Scipy Optimization with Smoothing Results (selection vector):", selection_scipy_lse)
+                print("Scipy Optimization with Smoothing Best Score:", approx_min_eig_val_scipy_lse)
                 print("Scipy Minimize LSE Results (K - max):", roundsolution(selection_scipy_lse, k))
                 print("Scipy Minimize LSE Results (Breakties):", roundsolution_breakties(selection_scipy_lse, k, inf_mats, H0))
                 print("Scipy Minimize LSE Results (Madow):", roundsolution_madow(selection_scipy_lse, k))
                 selection_vector = selection_scipy_lse.tolist()
             else:
                 selection_vector = None
-            print("Scipy Optimization with Smoothing Best Score:", approx_min_eig_val_scipy_lse)
+                print("Scipy Optimization with Smoothing Best Score:", approx_min_eig_val_scipy_lse)
 
             # Store results
             test_case_result['results']['Scipy Optimization with LSE'] = {
@@ -200,13 +202,14 @@ def run_tests():
                 )
                 if num_matrices == 10:
                     print("Frank-Wolfe Optimization Results (selection vector):", final_solution)
+                    print("Frank-Wolfe Optimization Best Score:", min_eig_val_rounded)
                     print("Frank-Wolfe Optimization Results (K - max):", roundsolution(final_solution, k))
                     print("Frank-Wolfe Optimization Results (Breakties):", roundsolution_breakties(final_solution, k, inf_mats, H0))
                     print("Frank-Wolfe Optimization Results (Madow):", roundsolution_madow(final_solution, k))
                     selection_vector = final_solution.tolist()
                 else:
                     selection_vector = None
-                print("Frank-Wolfe Optimization Best Score:", min_eig_val_rounded)
+                    print("Frank-Wolfe Optimization Best Score:", min_eig_val_rounded)
 
                 # Store results
                 test_case_result['results']['Frank-Wolfe Optimization'] = {
@@ -225,6 +228,10 @@ def run_tests():
 
             # Append the test case result to the results list
             results.append(test_case_result)
+
+    # Save results to a YAML file
+    with open('optimization_results.yaml', 'w') as yaml_file:
+        yaml.dump(results, yaml_file)
 
     print("\nTesting complete.")
 
