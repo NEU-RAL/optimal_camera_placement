@@ -1,0 +1,238 @@
+- k: 5
+  num_matrices: 10
+  results:
+    Frank-Wolfe Optimization:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - &id001 !!python/object/apply:numpy.dtype
+        args:
+        - f8
+        - false
+        - true
+        state: !!python/tuple
+        - 3
+        - <
+        - null
+        - null
+        - null
+        - -1
+        - -1
+        - 0
+      - !!binary |
+        oyEJkS23TUA=
+      execution_time: 30.747559547424316
+      selection_vector:
+      - 9.99655893785622e-06
+      - 9.99655893785622e-06
+      - 9.99655893785622e-06
+      - 9.99655893785622e-06
+      - 9.99655893785622e-06
+      - 0.9999100065579402
+      - 0.9999100065579402
+      - 0.9999100065579402
+      - 0.9999100065579402
+      - 0.9999100065579402
+    Greedy Selection:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        cNOiZdK3TUA=
+      execution_time: 0.0226438045501709
+      selection_vector:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+    Scipy Minimize:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        4ju2ZdK3TUA=
+      execution_time: 0.007890939712524414
+      selection_vector:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.9999999999966498
+      - 0.9999999999966498
+      - 0.9999999999966498
+      - 0.9999999999966498
+      - 0.9999999999966498
+    Scipy Optimization with LSE:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        iBKyZdK3TUA=
+      execution_time: 0.03045201301574707
+      selection_vector:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.9999999999987601
+      - 0.9999999999987601
+      - 0.9999999999987601
+      - 0.9999999999987601
+      - 0.9999999999987601
+- k: 3
+  num_matrices: 10
+  results:
+    Frank-Wolfe Optimization:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        a1776t9IQkA=
+      execution_time: 42.847501277923584
+      selection_vector:
+      - 9.99655893785622e-06
+      - 9.99655893785622e-06
+      - 9.99655893785622e-06
+      - 9.99655893785622e-06
+      - 9.99655893785622e-06
+      - 9.99655893785622e-06
+      - 9.99655893785622e-06
+      - 0.9999100065579402
+      - 0.9999100065579402
+      - 0.9999100065579402
+    Greedy Selection:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        l11t1jlJQkA=
+      execution_time: 0.012454509735107422
+      selection_vector:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 0.0
+      - 0.0
+    Scipy Minimize:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        hd9j1jlJQkA=
+      execution_time: 0.008080720901489258
+      selection_vector:
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.5999999999967205
+      - 0.5999999999967205
+      - 0.5999999999967205
+      - 0.5999999999967205
+      - 0.5999999999967205
+    Scipy Optimization with LSE:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        Fx9g1jlJQkA=
+      execution_time: 0.05711483955383301
+      selection_vector:
+      - 3.8613556796462944e-13
+      - 2.1782575743145571e-13
+      - 2.1782575743145571e-13
+      - 2.1360690993788012e-13
+      - 2.1360690993788012e-13
+      - 0.6000000000020798
+      - 0.6000000000020798
+      - 0.6000000000020798
+      - 0.6000000000020798
+      - 0.6000000000020798
+- k: 5
+  num_matrices: 100
+  results:
+    Frank-Wolfe Optimization:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        L51FxtywTUA=
+      execution_time: 14.074704647064209
+      selection_vector: null
+    Greedy Selection:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        cNOiZdK3TUA=
+      execution_time: 0.5194802284240723
+      selection_vector: null
+    Scipy Minimize:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        UvyxZdK3TUA=
+      execution_time: 0.0683748722076416
+      selection_vector: null
+    Scipy Optimization with LSE:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        4GuyZdK3TUA=
+      execution_time: 0.3141341209411621
+      selection_vector: null
+- k: 5
+  num_matrices: 1000
+  results:
+    Frank-Wolfe Optimization:
+      skipped: true
+    Greedy Selection:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        cNOiZdK3TUA=
+      execution_time: 2.845055341720581
+      selection_vector: null
+    Scipy Minimize:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        UvyxZdK3TUA=
+      execution_time: 13.059468030929565
+      selection_vector: null
+    Scipy Optimization with LSE:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        fXWoZdK3TUA=
+      execution_time: 11.353027820587158
+      selection_vector: null
+- k: 5
+  num_matrices: 2000
+  results:
+    Frank-Wolfe Optimization:
+      skipped: true
+    Greedy Selection:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        cNOiZdK3TUA=
+      execution_time: 3.4570088386535645
+      selection_vector: null
+    Scipy Minimize:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        UvyxZdK3TUA=
+      execution_time: 349.4774076938629
+      selection_vector: null
+    Scipy Optimization with LSE:
+      best_score: !!python/object/apply:numpy.core.multiarray.scalar
+      - *id001
+      - !!binary |
+        XqG6ZdK3TUA=
+      execution_time: 579.3660385608673
+      selection_vector: null

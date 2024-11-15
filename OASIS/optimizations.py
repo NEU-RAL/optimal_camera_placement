@@ -14,8 +14,7 @@ from gtsam.utils import plot
 # from Experiments import exp_utils
 from scipy.optimize import minimize, Bounds
 from numpy import linalg as la
-from nsopy.methods.subgradient import SubgradientMethod
-from nsopy.loggers import GenericDualMethodLogger
+from scipy.sparse import csr_matrix
 
 
 L = gtsam.symbol_shorthand.L
@@ -32,14 +31,31 @@ def greedy_selection(
     Nc: int,
     metric: Metric = Metric.MIN_EIG,
     num_runs: int = 1,
-    num_poses: int = 0  # Ensure this is passed when calling the function
+    num_poses: int = None  # Make num_poses a required argument
 ) -> Tuple[np.ndarray, float, np.ndarray]:
     """
-    Greedy selection algorithm to maximize information gain.
+    Greedy selection algorithm to maximize information gain using the Schur complement.
+
+    Args:
+        inf_mats (List[np.ndarray]): List of information matrices for each sensor.
+        prior (np.ndarray): Prior information matrix.
+        Nc (int): Number of sensors to select.
+        metric (Metric): Metric to use for selection.
+        num_runs (int): Number of runs (default is 1).
+        num_poses (int): Number of poses in the problem (must be provided).
+
+    Returns:
+        Tuple[np.ndarray, float, np.ndarray]: Selection vector, best score, and availability vector.
     """
+    if num_poses is None:
+        raise ValueError("num_poses must be provided and cannot be None.")
+
     best_selection_indices = []
     best_score = float('-inf')
     avail_cand = np.ones(len(inf_mats), dtype=int)
+
+    # Initialize the combined information matrix with the prior
+    combined_inf_mat = prior.copy()
 
     for run in range(num_runs):
         for i in range(Nc):
@@ -48,13 +64,31 @@ def greedy_selection(
 
             for j in range(len(inf_mats)):
                 if avail_cand[j] == 1:
-                    candidate_selection = np.zeros(len(inf_mats))
-                    candidate_selection[best_selection_indices + [j]] = 1
+                    # Tentatively add the candidate sensor's information matrix
+                    temp_inf_mat = combined_inf_mat + inf_mats[j]
 
-                    # Compute the minimum eigenvalue using the external function
-                    min_eig_val, _, _ = infmat.find_min_eig_pair(
-                        inf_mats, candidate_selection, prior, num_poses
-                    )
+                    # Compute the Schur complement
+                    total_size = temp_inf_mat.shape[0]
+                    pose_dim = 6  # Adjust if necessary
+                    num_pose_elements = num_poses * pose_dim
+                    measurement_dim = total_size - num_pose_elements
+
+                    Hll = temp_inf_mat[:measurement_dim, :measurement_dim]
+                    Hlx = temp_inf_mat[:measurement_dim, measurement_dim:]
+                    Hxx = temp_inf_mat[measurement_dim:, measurement_dim:]
+
+                    # Compute the inverse or pseudoinverse of Hll
+                    try:
+                        Hll_inv = np.linalg.inv(Hll)
+                    except np.linalg.LinAlgError:
+                        Hll_inv = np.linalg.pinv(Hll)
+
+                    # Compute the Schur complement
+                    H_schur = Hxx - Hlx.T @ Hll_inv @ Hlx
+
+                    # Compute the minimum eigenvalue of the Schur complement
+                    eigvals = np.linalg.eigvalsh(H_schur)
+                    min_eig_val = eigvals[0]
                     score = min_eig_val
 
                     if score > max_inf:
@@ -65,8 +99,9 @@ def greedy_selection(
                 best_score = max_inf
                 best_selection_indices.append(selected_cand)
                 avail_cand[selected_cand] = 0
-                print(f"Best Score till now: {best_score}")
-                print(f"Next best sensor index: {selected_cand}")
+
+                # Update the combined information matrix
+                combined_inf_mat += inf_mats[selected_cand]
 
     print("Selected candidates are:", best_selection_indices)
 
@@ -250,104 +285,6 @@ def roundsolution_madow(selection, k):
     print("Number of candidates selected after rounding:", np.sum(rounded_sol))
     return rounded_sol
 
-
-def branch_and_bound_with_cuts(
-    inf_mats, H0, num_poses, k, 
-    relaxed_solution, 
-    best_score=float('inf'), 
-    best_solution=None, 
-    depth=0, 
-    cut_threshold=0.2,  
-    fractional_cut_ratio=0.3 
-):
-    """
-    Combined Branch and Bound with Cuts function to optimize sensor selection.
-    Dynamically decides when to add cutting planes based on the fractionality
-    of the relaxed solution.
-
-    Args:
-        inf_mats (List[np.ndarray]): Information matrices for each sensor.
-        H0 (np.ndarray): Prior information matrix.
-        num_poses (int): Number of poses.
-        k (int): Maximum number of sensors to select.
-        relaxed_solution (np.ndarray): Continuous solution from a relaxed solver (e.g., Frank-Wolfe).
-        best_score (float): The current best score achieved by an integer solution.
-        best_solution (np.ndarray): The best binary selection solution found so far.
-        depth (int): Current depth of the recursion.
-        cut_threshold (float): Threshold for deciding when to consider a value fractional.
-        fractional_cut_ratio (float): Fractional value ratio for applying cuts (e.g., 0.3 for 30%).
-
-    Returns:
-        Tuple[np.ndarray, float]: The best binary selection solution and its sinfmat.
-    """
-
-    # Round the relaxed solution to get an initial feasible solution at the root depth
-    if depth == 0:
-        initial_solution = np.round(relaxed_solution).astype(int)
-        if np.sum(initial_solution) <= k:
-            initial_score = evaluate_solution(inf_mats, H0, initial_solution, num_poses)
-            if initial_score < best_score:
-                best_score = initial_score
-                best_solution = initial_solution
-
-    # Check if we should add cuts
-    def should_add_cut(solution):
-        # Count fractional values
-        fractional_indices = np.where((solution > cut_threshold) & (solution < 1 - cut_threshold))[0]
-        fractional_count = len(fractional_indices)
-        
-        # Decide to add cut based on the ratio of fractional values
-        return fractional_count > len(solution) * fractional_cut_ratio, fractional_indices
-
-    # Apply cutting planes if needed
-    add_cut, cut_indices = should_add_cut(relaxed_solution)
-    if add_cut:
-        # Simple heuristic cut by rounding fractional values close to 0 or 1
-        for idx in cut_indices:
-            relaxed_solution[idx] = 0 if relaxed_solution[idx] < 0.5 else 1
-
-    # Branching phase
-    fractional_indices = np.where((relaxed_solution > 0) & (relaxed_solution < 1))[0]
-    if len(fractional_indices) == 0:
-        return best_solution, best_score
-
-    # Select the most fractional value to branch on
-    idx_to_branch = fractional_indices[np.argmin(np.abs(relaxed_solution[fractional_indices] - 0.5))]
-
-    # Create two branches: one setting the selected index to 0 and one setting it to 1
-    for branch_value in [0, 1]:
-        new_solution = relaxed_solution.copy()
-        new_solution[idx_to_branch] = branch_value
-
-        # Ensure that the number of selected sensors does not exceed `k`
-        if np.sum(new_solution) > k:
-            continue  # Skip this branch if it doesn’t satisfy the "at most k" constraint
-
-        # Evaluate this new solution in its relaxed form
-        current_score = evaluate_solution(inf_mats, H0, new_solution, num_poses)
-
-        # Bounding: If this branch cannot yield a better result, prune it
-        if current_score >= best_score:
-            continue  # Prune this branch
-
-        # Recursively call branch_and_bound_with_cuts on this new solution
-        candidate_solution, candidate_score = branch_and_bound_with_cuts(
-            inf_mats, H0, num_poses, k, 
-            new_solution, 
-            best_score=best_score, 
-            best_solution=best_solution, 
-            depth=depth + 1, 
-            cut_threshold=cut_threshold,
-            fractional_cut_ratio=fractional_cut_ratio
-        )
-
-        # Update the best solution if we found a better one
-        if candidate_score < best_score:
-            best_score = candidate_score
-            best_solution = candidate_solution
-
-    return best_solution, best_score
-
 def evaluate_solution(inf_mats, H0, solution, num_poses):
     """
     Evaluates a binary solution by computing the smallest eigenvalue of the 
@@ -480,11 +417,11 @@ def scipy_minimize(inf_mats, H0, selection_init, k, num_poses, A, b):
     res = minimize(
         fun=lambda x: min_eig_obj_with_jac(x, inf_mats, H0, num_poses),
         x0=selection_init,
-        method='trust-constr',
+        method='SLSQP',
         jac=True,
         constraints=cons,
         bounds=bounds,
-        options={'disp': True}
+        options={'disp': False}
     )
 
     # Get the minimum eigenvalue of the continuous solution
@@ -612,7 +549,7 @@ def scipy_minimize_lse(inf_mats, H0, selection_init, num_poses, A, b):
         jac=True,
         constraints=cons,
         bounds=bounds,
-        options={'disp': True, 'maxiter': 1000, 'ftol': 1e-9}
+        options={'disp': False, 'maxiter': 1000, 'ftol': 1e-9}
     )
 
     # Get the approximated minimum eigenvalue of the continuous solution
