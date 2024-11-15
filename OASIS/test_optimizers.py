@@ -7,6 +7,9 @@ from optimizations import (
     frank_wolfe_optimization,
     scipy_minimize,
     scipy_minimize_lse,
+    roundsolution,
+    roundsolution_breakties,
+    roundsolution_madow
 )
 
 # Define Metric Enum for selection
@@ -17,25 +20,24 @@ class Metric(Enum):
 
 def generate_random_fim(num_matrices, matrix_size):
     """
-    Generates a list of matrices where all but five are identity matrices,
-    and the remaining five are random symmetric positive-definite matrices.
+    Generates a list of completely random symmetric positive-definite matrices
+    using random eigenvalues and orthogonal matrices.
     """
     np.random.seed(40)
     inf_mats = []
 
-    # Generate identity matrices
-    for _ in range(num_matrices - 5):
-        inf_mats.append(np.eye(matrix_size))
+    for i in range(num_matrices):
+        # Generate random positive eigenvalues
+        eigenvalues = np.random.uniform(low=2, high=100, size=matrix_size)
+        # Generate a random orthogonal matrix
+        Q, _ = np.linalg.qr(np.random.randn(matrix_size, matrix_size))
+        # Construct the positive-definite matrix
+        inf_mat = Q @ np.diag(eigenvalues) @ Q.T
+        inf_mats.append(inf_mat)
 
-    # Generate five special positive-definite matrices
-    target_min_eigenvalue = 5
-    A = np.random.rand(matrix_size, matrix_size)
-    inf_mat = A @ A.T
-    min_eigenvalue = np.linalg.eigvalsh(inf_mat).min()
-    if min_eigenvalue < target_min_eigenvalue:
-        inf_mat *= (target_min_eigenvalue / min_eigenvalue + 1e-6)
-    for _ in range(5):
-        inf_mats.append(inf_mat.copy())
+        # Calculate and print the minimum eigenvalue
+        min_eig_val = np.min(eigenvalues)
+        print(f"Matrix {i + 1}: Minimum eigenvalue = {min_eig_val:.4f}")
 
     return inf_mats
 
@@ -57,7 +59,7 @@ def run_tests():
     num_poses = 6
 
     # Define the list of num_matrices to test
-    num_matrices_list = [10, 100, 1000, 2000]
+    num_matrices_list = [10, 100, 1000]
 
     # Initialize a list to store the results
     results = []
@@ -134,6 +136,9 @@ def run_tests():
             )
             if num_matrices == 10:
                 print("Scipy Minimize Results (selection vector):", continuous_sol_scipy)
+                print("Scipy Minimize Results (K - max):", roundsolution(continuous_sol_scipy, k))
+                print("Scipy Minimize Results (Breakties):", roundsolution_breakties(continuous_sol_scipy, k, inf_mats, H0))
+                print("Scipy Minimize Results (Madow):", roundsolution_madow(continuous_sol_scipy, k))
                 selection_vector = continuous_sol_scipy.tolist()
             else:
                 selection_vector = None
@@ -161,6 +166,9 @@ def run_tests():
             )
             if num_matrices == 10:
                 print("Scipy Optimization with Smoothing Results (selection vector):", selection_scipy_lse)
+                print("Scipy Minimize LSE Results (K - max):", roundsolution(continuous_sol_scipy, k))
+                print("Scipy Minimize LSE Results (Breakties):", roundsolution_breakties(continuous_sol_scipy, k, inf_mats, H0))
+                print("Scipy Minimize LSE Results (Madow):", roundsolution_madow(continuous_sol_scipy, k))
                 selection_vector = selection_scipy_lse.tolist()
             else:
                 selection_vector = None
@@ -206,7 +214,7 @@ def run_tests():
 
                 print("\n" + "#" * 70)
             else:
-                print("Frank-Wolfe Optimization skipped for num_matrices =", num_matrices)
+                # print("Frank-Wolfe Optimization skipped for num_matrices =", num_matrices)
                 # Indicate that Frank-Wolfe was skipped
                 test_case_result['results']['Frank-Wolfe Optimization'] = {
                     'skipped': True
