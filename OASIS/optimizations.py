@@ -2,6 +2,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 from scipy.optimize import linprog, minimize_scalar
 import gtsam
+import scipy
 from enum import Enum
 from enum import Enum
 import utilities
@@ -12,9 +13,11 @@ from functools import partial
 from typing import List, Optional
 from gtsam.utils import plot
 # from Experiments import exp_utils
-from scipy.optimize import minimize, Bounds
+from scipy.optimize import minimize, Bounds, LinearConstraint
 from numpy import linalg as la
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, identity, diags
+from scipy.sparse.linalg import eigsh, spsolve
+from joblib import Parallel, delayed
 
 
 L = gtsam.symbol_shorthand.L
@@ -24,6 +27,96 @@ class Metric(Enum):
     LOGDET = 1
     MIN_EIG = 2
     MSE = 3
+
+def compute_combined_fim(x, inf_mats, H0):
+    combined_fim = H0.copy()
+    for xi, Hi in zip(x, inf_mats):
+        combined_fim += xi * Hi
+    return combined_fim    
+
+def compute_gradient(idx, Hi, Hll_factorized, Hlx, X, t2, min_eig_vec, measurement_dim):
+    """
+    Computes the gradient for a single index in the loop.
+    Args:
+        idx (int): Index of the current matrix.
+        Hi (sparse matrix): Current sparse information matrix.
+        Hll_factorized (SuperLU object): Factorized Hll matrix for efficient solving.
+        Hlx (sparse matrix): Landmark-to-pose cross information matrix.
+        X (sparse matrix): Intermediate matrix from Schur complement computation.
+        t2 (sparse matrix): Precomputed intermediate matrix.
+        min_eig_vec (np.ndarray): Eigenvector corresponding to the smallest eigenvalue.
+        measurement_dim (int): Dimensionality of the measurement space.
+
+    Returns:
+        float: Gradient value for the current index.
+    """
+    # Extract submatrices from Hi
+    Hll_i = Hi[:measurement_dim, :measurement_dim]
+    Hlx_i = Hi[:measurement_dim, measurement_dim:]
+    Hxx_i = Hi[measurement_dim:, measurement_dim:]
+
+    # Solve Hll * Y = Hlx_i using the pre-factorized Hll
+    Y = Hll_factorized.solve(Hlx_i.toarray())
+
+    # Compute grad_schur = Hxx_i - Hlx_i.T @ X - t2 @ Hll_i @ Y + t2 @ Hlx_i
+    grad_schur = (
+        Hxx_i - Hlx_i.transpose().dot(X)
+        - t2.dot(Hll_i.dot(Y))
+        + t2.dot(Hlx_i)
+    )
+
+    # Flatten vectors to ensure proper alignment
+    grad_val = -min_eig_vec.flatten().dot(grad_schur.dot(min_eig_vec).flatten())
+    return grad_val
+
+
+def compute_gradients_parallel(inf_mats, Hll, Hlx, X, t2, min_eig_vec, measurement_dim):
+    """
+    Parallel computation of gradients using joblib.
+    Args:
+        inf_mats (List[sparse matrix]): List of sparse information matrices.
+        Hll (sparse matrix): Landmark-to-landmark information matrix.
+        Hlx (sparse matrix): Landmark-to-pose cross information matrix.
+        X (sparse matrix): Intermediate matrix from Schur complement computation.
+        t2 (sparse matrix): Precomputed intermediate matrix.
+        min_eig_vec (np.ndarray): Eigenvector corresponding to the smallest eigenvalue.
+        measurement_dim (int): Dimensionality of the measurement space.
+
+    Returns:
+        np.ndarray: Gradient vector for all indices.
+    """
+    # Factorize Hll once for efficient solving
+    Hll_factorized = splu(Hll)
+
+    # Parallel computation
+    grad = Parallel(n_jobs=-1)(
+        delayed(compute_gradient)(
+            idx, Hi, Hll_factorized, Hlx, X, t2, min_eig_vec, measurement_dim
+        ) for idx, Hi in enumerate(inf_mats)
+    )
+
+    return np.array(grad)
+
+
+def gradient_main_function(inf_mats, Hll, Hlx, X, t2, min_eig_vec, measurement_dim):
+    """
+    Main function for computing gradients in parallel.
+    Args:
+        inf_mats (List[sparse matrix]): List of sparse information matrices.
+        Hll (sparse matrix): Landmark-to-landmark information matrix.
+        Hlx (sparse matrix): Landmark-to-pose cross information matrix.
+        X (sparse matrix): Intermediate matrix from Schur complement computation.
+        t2 (sparse matrix): Precomputed intermediate matrix.
+        min_eig_vec (np.ndarray): Eigenvector corresponding to the smallest eigenvalue.
+        measurement_dim (int): Dimensionality of the measurement space.
+
+    Returns:
+        np.ndarray: Gradient vector for all indices.
+    """
+    grad = compute_gradients_parallel(
+        inf_mats, Hll, Hlx, X, t2, min_eig_vec, measurement_dim
+    )
+    return grad
 
 def greedy_selection(
     inf_mats: List[np.ndarray],
@@ -37,7 +130,7 @@ def greedy_selection(
     Greedy selection algorithm to maximize information gain using the Schur complement.
 
     Args:
-        inf_mats (List[np.ndarray]): List of information matrices for each sensor.
+        inf_mats (List[np.ndarray or sparse matrix]): List of information matrices for each sensor.
         prior (np.ndarray): Prior information matrix.
         Nc (int): Number of sensors to select.
         metric (Metric): Metric to use for selection.
@@ -73,18 +166,30 @@ def greedy_selection(
                     num_pose_elements = num_poses * pose_dim
                     measurement_dim = total_size - num_pose_elements
 
+                    # Ensure the dimensions of submatrices are correct
+                    if measurement_dim <= 0:
+                        raise ValueError(f"Invalid measurement dimension: {measurement_dim}")
+
                     Hll = temp_inf_mat[:measurement_dim, :measurement_dim]
                     Hlx = temp_inf_mat[:measurement_dim, measurement_dim:]
                     Hxx = temp_inf_mat[measurement_dim:, measurement_dim:]
 
-                    # Compute the inverse or pseudoinverse of Hll
+                    # Convert Hll to dense if it is sparse
+                    if scipy.sparse.issparse(Hll):
+                        Hll = Hll.toarray()
+
+                    # Regularize and compute the pseudoinverse of Hll
+                    reg_term = 1e-8 * np.eye(Hll.shape[0])
                     try:
-                        Hll_inv = np.linalg.inv(Hll)
-                    except np.linalg.LinAlgError:
-                        Hll_inv = np.linalg.pinv(Hll)
+                        Hll_inv = np.linalg.pinv(Hll + reg_term)
+                    except np.linalg.LinAlgError as e:
+                        raise ValueError(f"Failed to compute pseudoinverse for candidate {j}: {e}")
 
                     # Compute the Schur complement
                     H_schur = Hxx - Hlx.T @ Hll_inv @ Hlx
+
+                    # Ensure H_schur is symmetric
+                    H_schur = (H_schur + H_schur.T) / 2
 
                     # Compute the minimum eigenvalue of the Schur complement
                     eigvals = np.linalg.eigvalsh(H_schur)
@@ -324,14 +429,14 @@ def min_eig_obj_with_jac(x, inf_mats, H0, num_poses):
 
     Args:
         x (np.ndarray): Continuous selection vector.
-        inf_mats (List[np.ndarray]): List of information matrices for each sensor.
-        H0 (np.ndarray): Prior information matrix.
+        inf_mats (List[scipy.sparse.csr_matrix]): List of sparse information matrices.
+        H0 (scipy.sparse.csr_matrix): Prior information matrix.
         num_poses (int): Number of poses.
 
     Returns:
-        Tuple[float, np.ndarray]: The objective function value and its gradient with respect to x.
+        Tuple[float, np.ndarray]: Objective function value and gradient.
     """
-
+    # Combine the Fisher Information Matrices
     combined_fim = H0.copy()
     for xi, Hi in zip(x, inf_mats):
         combined_fim += xi * Hi
@@ -342,50 +447,54 @@ def min_eig_obj_with_jac(x, inf_mats, H0, num_poses):
     total_size = combined_fim.shape[0]
     measurement_dim = total_size - num_pose_elements
 
-    Hll = combined_fim[:measurement_dim, :measurement_dim]
-    Hlx = combined_fim[:measurement_dim, measurement_dim:]
-    Hxx = combined_fim[measurement_dim:, measurement_dim:]
+    # Slice the combined_fim to get Hll, Hlx, Hxx
+    Hll = combined_fim[:measurement_dim, :measurement_dim].tocsc()
+    Hlx = combined_fim[:measurement_dim, measurement_dim:].tocsc()
+    Hxx = combined_fim[measurement_dim:, measurement_dim:].tocsc()
 
-    # Compute the inverse or pseudoinverse of Hll
+    # Compute the inverse of Hll (solve Hll * X = Hlx)
     try:
-        Hll_inv = np.linalg.inv(Hll)
-    except np.linalg.LinAlgError:
-        Hll_inv = np.linalg.pinv(Hll)
+        X = spsolve(Hll, Hlx)
+    except Exception as e:
+        print("Linear solver failed:", e)
+        X = Hll.inverse().dot(Hlx)  
 
-    # Compute the Schur complement
-    H_schur = Hxx - Hlx.T @ Hll_inv @ Hlx
+    # Compute the Schur complement: H_schur = Hxx - Hlx^T * X
+    H_schur = Hxx - Hlx.transpose().dot(X)
 
-    # Compute eigenvalues and eigenvectors of H_schur
-    eigvals, eigvecs = np.linalg.eigh(H_schur)
-    min_eig_index = np.argmin(eigvals)
-    min_eig_val = eigvals[min_eig_index]
-    min_eig_vec = eigvecs[:, min_eig_index] 
+    # Compute the smallest eigenvalue and corresponding eigenvector using eigsh
+    try:
+        min_eig_val, min_eig_vec = eigsh(H_schur, k=1, which='SA')
+    except Exception as e:
+        print("Eigenvalue solver failed:", e)
+        min_eig_val = 0.0
+        min_eig_vec = np.zeros(H_schur.shape[1])
 
     # Objective function value (negative smallest eigenvalue)
-    f = -min_eig_val
+    f = -min_eig_val[0]
 
-    # Precompute constants
-    t0 = Hlx.T
-    t1 = Hll_inv
-    t2 = t0 @ t1
+    # Precompute constants for gradient
+    t2 = X.transpose()
 
     # Compute the gradient
     grad = np.zeros_like(x)
     for idx, Hi in enumerate(inf_mats):
-        # Corrected submatrix extraction
-        Hll_i = Hi[:measurement_dim, :measurement_dim]
-        Hlx_i = Hi[:measurement_dim, measurement_dim:]
-        Hxx_i = Hi[measurement_dim:, measurement_dim:]
+        # Extract submatrices from Hi
+        Hll_i = Hi[:measurement_dim, :measurement_dim].tocsc()
+        Hlx_i = Hi[:measurement_dim, measurement_dim:].tocsc()
+        Hxx_i = Hi[measurement_dim:, measurement_dim:].tocsc()
 
-        # Compute grad_schur using the same formula as in Frank-Wolfe
-        grad_schur = Hxx_i - (
-            Hlx_i.T @ Hll_inv @ Hlx
-            - t2 @ Hll_i @ Hll_inv @ Hlx
-            + t2 @ Hlx_i
-        )
+        # Compute grad_schur = Hxx_i - Hlx_i^T * X - t2 * Hll_i * Y + t2 * Hlx_i
+        try:
+            Y = spsolve(Hll, Hlx_i)
+        except Exception as e:
+            print(f"Linear solver failed for Hi index {idx}:", e)
+            Y = Hll.inverse().dot(Hlx_i)  # Fallback to inverse if spsolve fails
 
-        # Gradient component using the pose eigenvector
-        grad[idx] = -min_eig_vec.T @ grad_schur @ min_eig_vec
+        grad_schur = Hxx_i - Hlx_i.transpose().dot(X) - t2.dot(Hll_i.dot(Y)) + t2.dot(Hlx_i)
+
+        # Flatten vectors to ensure proper alignment
+        grad[idx] = -min_eig_vec.flatten().dot(grad_schur.dot(min_eig_vec).flatten())
 
     return f, grad
 
@@ -406,23 +515,24 @@ def scipy_minimize(inf_mats, H0, selection_init, k, num_poses, A, b):
     Returns:
         Tuple[np.ndarray, float]: Continuous solution vector, maximum minimum eigenvalue.
     """
-    # Set bounds for each variable in x (between 0 and 1) to represent selection probabilities
-    bounds = [(0, 1) for _ in range(selection_init.shape[0])]
+    # Optimization function that maximizes the smallest eigenvalue
+    bounds = Bounds([0] * len(selection_init), [1] * len(selection_init))  # Bounds between 0 and 1 for all variables
+    linear_constraint = LinearConstraint(A, -np.inf, b)  # Ax <= b
 
-    # Define constraints to include both the sum constraint and inequality constraints
-    cons = [
-        {'type': 'ineq', 'fun': lambda x: b - A @ x}     # Inequality constraints Ax <= b
-    ]
+    # Define a callable that returns the identity matrix
+    def hess_identity_callable(x):
+        return identity(len(x), format='csr')
 
     # Optimization function that maximizes the smallest eigenvalue
     res = minimize(
         fun=lambda x: min_eig_obj_with_jac(x, inf_mats, H0, num_poses),
         x0=selection_init,
-        method='SLSQP',
-        jac=True,
-        constraints=cons,
+        method='trust-constr',
+        jac=True, 
+        hess=hess_identity_callable, 
+        constraints=linear_constraint,
         bounds=bounds,
-        options={'disp': True, 'maxiter': 1000, 'ftol': 1e-4}
+        options={'disp': True, 'maxiter': 10000, 'verbose': 0}  # Verbose for detailed output
     )
 
     # Get the minimum eigenvalue of the continuous solution

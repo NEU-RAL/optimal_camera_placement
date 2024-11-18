@@ -18,8 +18,8 @@
         - -1
         - 0
       - !!binary |
-        2I10p3MjaUA=
-      execution_time: 2.91717529296875
+        3410p3MjaUA=
+      execution_time: 1.9154884815216064
       selection_vector:
       - 0.4032714196162138
       - 0.506719695478283
@@ -35,8 +35,8 @@
       best_score: !!python/object/apply:numpy.core.multiarray.scalar
       - *id001
       - !!binary |
-        TGmfFllrZ0A=
-      execution_time: 0.013407230377197266
+        S2mfFllrZ0A=
+      execution_time: 0.0036497116088867188
       selection_vector:
       - 0.0
       - 1.0
@@ -52,36 +52,36 @@
       best_score: !!python/object/apply:numpy.core.multiarray.scalar
       - *id001
       - !!binary |
-        ag8d5j02aUA=
-      execution_time: 0.15232539176940918
+        WnBT5j02aUA=
+      execution_time: 0.09782576560974121
       selection_vector:
-      - 0.34311492285716205
-      - 0.49091565683898614
-      - 0.9504313806245562
-      - 0.40722247624261015
-      - 0.5101840116799096
-      - 0.5047731077152783
-      - 0.5182700008993827
-      - 0.8833149666264527
-      - 0.23260089486847657
-      - 0.15917257632410747
+      - 0.3431150012265394
+      - 0.49091547978919864
+      - 0.9504311969943086
+      - 0.40722270454955983
+      - 0.510183596952709
+      - 0.5047734162250246
+      - 0.5182701858077849
+      - 0.8833149267873982
+      - 0.23260092361659604
+      - 0.1591725668251481
     Scipy Optimization with LSE:
       best_score: !!python/object/apply:numpy.core.multiarray.scalar
       - *id001
       - !!binary |
-        GarZ+i4kaUA=
-      execution_time: 0.2176525592803955
+        R2NL+i4kaUA=
+      execution_time: 0.05898642539978027
       selection_vector:
-      - 0.28752743019622884
-      - 0.541126825507369
-      - 0.9561717873982366
-      - 0.4014070212615929
-      - 0.5496748528505512
-      - 0.3628568247983766
-      - 0.6048912598490214
-      - 0.9267404644478682
-      - 0.28717477478304443
-      - 0.08242876103374107
+      - 0.28752743878539044
+      - 0.5411268060156177
+      - 0.9561717970537679
+      - 0.40140701225170733
+      - 0.5496748599740294
+      - 0.36285684631062887
+      - 0.6048912765868526
+      - 0.926740479351313
+      - 0.28717476130912023
+      - 0.08242871813530693
 - k: 3
   num_matrices: 10
   results:
@@ -89,8 +89,8 @@
       best_score: !!python/object/apply:numpy.core.multiarray.scalar
       - *id001
       - !!binary |
-        fE/K7i9ZXkA=
-      execution_time: 13.975170135498047
+        dk/K7i9ZXkA=
+      execution_time: 7.349707126617432
       selection_vector:
       - 0.2124858829500874
       - 0.2917362780731393
@@ -106,8 +106,8 @@
       best_score: !!python/object/apply:numpy.core.multiarray.scalar
       - *id001
       - !!binary |
-        Hrn2n8DcWEA=
-      execution_time: 0.012392520904541016
+        Hbn2n8DcWEA=
+      execution_time: 0.002336740493774414
       selection_vector:
       - 0.0
       - 0.0
@@ -123,36 +123,36 @@
       best_score: !!python/object/apply:numpy.core.multiarray.scalar
       - *id001
       - !!binary |
-        EYTQZVVbXkA=
-      execution_time: 0.0836939811706543
+        MpTZZVVbXkA=
+      execution_time: 0.05467700958251953
       selection_vector:
-      - 0.20118659757167176
-      - 0.2971430814996667
-      - 0.5761073957899465
-      - 0.24273525355450432
-      - 0.30892448227302516
-      - 0.301500214026864
-      - 0.3059015387734171
-      - 0.5321467059252717
-      - 0.14038828834833358
-      - 0.0939664424487284
+      - 0.2011867416065101
+      - 0.2971431247408857
+      - 0.5761074415449778
+      - 0.24273508476807093
+      - 0.30892459003427797
+      - 0.3014999531486567
+      - 0.3059016703203643
+      - 0.5321466669025577
+      - 0.14038816342411564
+      - 0.0939665660182261
     Scipy Optimization with LSE:
       best_score: !!python/object/apply:numpy.core.multiarray.scalar
       - *id001
       - !!binary |
-        cpngnblDXkA=
-      execution_time: 0.1800060272216797
+        yIlcm7lDXkA=
+      execution_time: 0.04213905334472656
       selection_vector:
-      - 0.18623646329823682
-      - 0.26619571606831266
-      - 0.6082333340419813
-      - 0.20529578366858056
-      - 0.32085061823736366
-      - 0.25789841807881675
-      - 0.3140025675192865
-      - 0.5274678632829365
-      - 0.22433369295606823
-      - 0.08948554878626898
+      - 0.18623645250528797
+      - 0.2661956636484019
+      - 0.6082334008765252
+      - 0.2052958020202034
+      - 0.32085055310350813
+      - 0.257898377663704
+      - 0.31400264786119253
+      - 0.5274678286012622
+      - 0.22433372908253624
+      - 0.08948554381268391
 - k: 5
   num_matrices: 100
   results:
@@ -160,27 +160,27 @@
       best_score: !!python/object/apply:numpy.core.multiarray.scalar
       - *id001
       - !!binary |
-        LAsnKdHubkA=
-      execution_time: 19.778890371322632
+        NQsnKdHubkA=
+      execution_time: 9.525209665298462
       selection_vector: null
     Greedy Selection:
       best_score: !!python/object/apply:numpy.core.multiarray.scalar
       - *id001
       - !!binary |
-        jglS5BnfaUA=
-      execution_time: 0.2755165100097656
+        jAlS5BnfaUA=
+      execution_time: 0.039914846420288086
       selection_vector: null
     Scipy Minimize:
       best_score: !!python/object/apply:numpy.core.multiarray.scalar
       - *id001
       - !!binary |
-        354u7QQ7b0A=
-      execution_time: 5.9610795974731445
+        W7i8xkw7b0A=
+      execution_time: 2.9310576915740967
       selection_vector: null
     Scipy Optimization with LSE:
       best_score: !!python/object/apply:numpy.core.multiarray.scalar
       - *id001
       - !!binary |
-        mhRy6MYDb0A=
-      execution_time: 15.700501203536987
+        SvHnp/gDb0A=
+      execution_time: 3.5854287147521973
       selection_vector: null

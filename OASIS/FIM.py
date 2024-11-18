@@ -9,6 +9,8 @@ from gtsam import (
     noiseModel
 )
 
+import scipy.sparse
+
 # RangeFactor,
 from numpy import linalg as la
 
@@ -149,22 +151,62 @@ def compute_CRLB(vals, graph):
 
     return hess, cov
 
+# def compute_schur_fim(fim, num_poses):
+#     """
+#     Computes the Schur complement of the FIM for reduced dimensionality.
+#     Args:
+#         fim (np.ndarray): Full Fisher Information Matrix (FIM).
+#         num_poses (int): Number of poses in the graph.
+
+#     Returns:
+#         np.ndarray: Schur complement of the FIM with respect to the pose variables.
+#     """
+#     # Extract blocks of the FIM matrix for poses and landmarks
+#     Hxx = fim[-num_poses * 6:, -num_poses * 6:]    # Pose-to-pose information
+#     Hll = fim[0: -num_poses * 6, 0: -num_poses * 6]  # Landmark-to-landmark information
+#     Hlx = fim[0: -num_poses * 6, -num_poses * 6:]  # Landmark-to-pose cross information
+
+#     Hxx_schur = Hxx - Hlx.T @ np.linalg.pinv(Hll) @ Hlx
+#     Hxx_schur = (Hxx_schur + Hxx_schur.T) / 2
+
+#     return Hxx_schur
+
 def compute_schur_fim(fim, num_poses):
     """
     Computes the Schur complement of the FIM for reduced dimensionality.
+
     Args:
-        fim (np.ndarray): Full Fisher Information Matrix (FIM).
+        fim (np.ndarray or scipy.sparse.spmatrix): Full Fisher Information Matrix (FIM).
         num_poses (int): Number of poses in the graph.
 
     Returns:
         np.ndarray: Schur complement of the FIM with respect to the pose variables.
     """
-    # Extract blocks of the FIM matrix for poses and landmarks
-    Hxx = fim[-num_poses * 6:, -num_poses * 6:]    # Pose-to-pose information
-    Hll = fim[0: -num_poses * 6, 0: -num_poses * 6]  # Landmark-to-landmark information
-    Hlx = fim[0: -num_poses * 6, -num_poses * 6:]  # Landmark-to-pose cross information
+    pose_dim = 6
+    num_pose_elements = num_poses * pose_dim
 
-    Hxx_schur = Hxx - Hlx.T @ np.linalg.pinv(Hll) @ Hlx
+    # Validate FIM dimensions
+    if fim.shape[0] <= num_pose_elements or fim.shape[1] <= num_pose_elements:
+        raise ValueError("FIM dimensions are too small for the given number of poses.")
+
+    # Extract blocks of the FIM matrix for poses and landmarks
+    Hxx = fim[-num_pose_elements:, -num_pose_elements:]
+    Hll = fim[: -num_pose_elements, : -num_pose_elements]
+    Hlx = fim[: -num_pose_elements, -num_pose_elements:]
+
+    # Handle sparse matrices
+    Hll_dense = Hll.toarray() if scipy.sparse.issparse(Hll) else Hll
+    Hlx_dense = Hlx.toarray() if scipy.sparse.issparse(Hlx) else Hlx
+    Hxx_dense = Hxx.toarray() if scipy.sparse.issparse(Hxx) else Hxx
+
+    # Regularize and compute the pseudoinverse of Hll
+    reg_term = 1e-8 * np.eye(Hll_dense.shape[0])
+    Hll_inv = np.linalg.pinv(Hll_dense + reg_term)
+
+    # Compute the Schur complement
+    Hxx_schur = Hxx_dense - Hlx_dense.T @ Hll_inv @ Hlx_dense
+
+    # Enforce symmetry
     Hxx_schur = (Hxx_schur + Hxx_schur.T) / 2
 
     return Hxx_schur

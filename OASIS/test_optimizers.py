@@ -2,6 +2,9 @@ import numpy as np
 import time
 import yaml
 from enum import Enum
+from scipy.sparse import random as sparse_random
+from scipy.sparse import csr_matrix, diags
+from scipy.stats import uniform
 from optimizations import (
     greedy_selection,
     frank_wolfe_optimization,
@@ -18,26 +21,49 @@ class Metric(Enum):
     MIN_EIG = 2
     MSE = 3
 
-def generate_random_fim(num_matrices, matrix_size):
+def generate_random_fim(num_matrices, matrix_size, density=0.1, min_eigenvalue=2.0, random_state=40):
     """
-    Generates a list of completely random symmetric positive-definite matrices
-    using random eigenvalues and orthogonal matrices.
+    Generates a list of random sparse symmetric positive-definite matrices.
+
+    Each matrix is constructed as A = B^T B + cI, where:
+    - B is a random sparse matrix with a specified density.
+    - c is a constant added to the diagonal to ensure positive-definiteness.
+
+    Args:
+        num_matrices (int): Number of matrices to generate.
+        matrix_size (int): Size of the square matrices (number of rows/columns).
+        density (float, optional): Density of the random sparse matrix B (fraction of non-zero elements). Default is 0.1.
+        min_eigenvalue (float, optional): Minimum eigenvalue for positive-definiteness. Default is 2.0.
+        random_state (int, optional): Seed for reproducibility. Default is 40.
+
+    Returns:
+        List[scipy.sparse.csr_matrix]: List of sparse symmetric positive-definite matrices in CSR format.
     """
-    np.random.seed(40)
+    np.random.seed(random_state)
     inf_mats = []
 
     for i in range(num_matrices):
-        # Generate random positive eigenvalues
-        eigenvalues = np.random.uniform(low=2, high=100, size=matrix_size)
-        # Generate a random orthogonal matrix
-        Q, _ = np.linalg.qr(np.random.randn(matrix_size, matrix_size))
-        # Construct the positive-definite matrix
-        inf_mat = Q @ np.diag(eigenvalues) @ Q.T
-        inf_mats.append(inf_mat)
+        # Generate a random sparse matrix B with standard normal distributed non-zero entries
+        B = sparse_random(matrix_size, matrix_size, density=density, format='csr', 
+                         data_rvs=np.random.randn)
 
-        # Calculate and print the minimum eigenvalue
-        min_eig_val = np.min(eigenvalues)
-        # print(f"Matrix {i + 1}: Minimum eigenvalue = {min_eig_val:.4f}")
+        # Compute A = B^T B to ensure positive semi-definiteness
+        A = B.transpose().dot(B)
+
+        # Add c*I to make it positive definite
+        # Here, c is set to min_eigenvalue to ensure all eigenvalues >= min_eigenvalue
+        c = min_eigenvalue
+        A += diags([c] * matrix_size, format='csr')
+
+        inf_mats.append(A)
+
+        # Optional: Verify the minimum eigenvalue (for debugging purposes)
+        # For large matrices, computing eigenvalues can be expensive
+        # Uncomment the following lines if you want to verify for small matrices
+        # if matrix_size <= 100:
+        #     eigvals = np.linalg.eigvalsh(A.toarray())
+        #     min_eig_val = np.min(eigvals)
+        #     print(f"Matrix {i + 1}: Minimum eigenvalue = {min_eig_val:.4f}")
 
     return inf_mats
 
@@ -59,7 +85,10 @@ def run_tests():
     num_poses = 6
 
     # Define the list of num_matrices to test
-    num_matrices_list = [1000]
+    num_matrices_list = [10]
+    density = 0.05        # 5% non-zero elements
+    min_eigenvalue = 5.0  # Minimum eigenvalue
+
 
     # Initialize a list to store the results
     results = []
@@ -76,15 +105,15 @@ def run_tests():
         matrix_size = measurement_dim + num_poses * pose_dim
 
         # Generate synthetic data
-        inf_mats = generate_random_fim(num_matrices, matrix_size)
-        H0 = np.eye(matrix_size)
+        inf_mats = generate_random_fim(num_matrices, matrix_size, density, min_eigenvalue)
+
+        H0 = diags([min_eigenvalue] * matrix_size, format='csr')
         selection_init = np.ones(num_matrices, dtype=np.float16) / num_matrices
 
-        # Iterate over k_values
         for k in k_values:
             # Constraint setup for optimization methods
-            A = np.ones((1, num_matrices))
-            b = np.array([k])
+            A = csr_matrix(np.ones((1, num_matrices)))  # Create A as a sparse matrix
+            b = np.array([k]) 
 
             print(f"\nRunning tests for num_matrices = {num_matrices}, k = {k}")
 
@@ -94,6 +123,38 @@ def run_tests():
                 'k': k,
                 'results': {}
             }
+
+            # Run Scipy Minimize Optimization
+            print("\nRunning Scipy Minimize Optimization")
+            (continuous_sol_scipy, min_eig_val_scipy), exec_time = time_function(
+                scipy_minimize,
+                inf_mats=inf_mats,
+                H0=H0,
+                selection_init=selection_init,
+                k=k,
+                num_poses=num_poses,
+                A=A,
+                b=b
+            )
+            if num_matrices == 10:
+                print("Scipy Minimize Results (selection vector):", continuous_sol_scipy)
+                print("Scipy Minimize Best Score:", min_eig_val_scipy)
+                # print("Scipy Minimize Results (K - max):", roundsolution(continuous_sol_scipy, k))
+                # print("Scipy Minimize Results (Breakties):", roundsolution_breakties(continuous_sol_scipy, k, inf_mats, H0))
+                # print("Scipy Minimize Results (Madow):", roundsolution_madow(continuous_sol_scipy, k))
+                selection_vector = continuous_sol_scipy.tolist()
+            else:
+                selection_vector = None
+                print("Scipy Minimize Best Score:", min_eig_val_scipy)
+
+            # Store results
+            test_case_result['results']['Scipy Minimize'] = {
+                'execution_time': exec_time,
+                'best_score': min_eig_val_scipy,
+                'selection_vector': selection_vector
+            }
+
+            print("\n" + "#" * 70)
 
             # Run Greedy Selection
             print("\nRunning Greedy Selection")
@@ -117,38 +178,6 @@ def run_tests():
             test_case_result['results']['Greedy Selection'] = {
                 'execution_time': exec_time,
                 'best_score': best_score,
-                'selection_vector': selection_vector
-            }
-
-            print("\n" + "#" * 70)
-
-            # Run Scipy Minimize Optimization
-            print("\nRunning Scipy Minimize Optimization")
-            (continuous_sol_scipy, min_eig_val_scipy), exec_time = time_function(
-                scipy_minimize,
-                inf_mats=inf_mats,
-                H0=H0,
-                selection_init=selection_init,
-                k=k,
-                num_poses=num_poses,
-                A=A,
-                b=b
-            )
-            if num_matrices == 10:
-                print("Scipy Minimize Results (selection vector):", continuous_sol_scipy)
-                print("Scipy Minimize Best Score:", min_eig_val_scipy)
-                print("Scipy Minimize Results (K - max):", roundsolution(continuous_sol_scipy, k))
-                print("Scipy Minimize Results (Breakties):", roundsolution_breakties(continuous_sol_scipy, k, inf_mats, H0))
-                print("Scipy Minimize Results (Madow):", roundsolution_madow(continuous_sol_scipy, k))
-                selection_vector = continuous_sol_scipy.tolist()
-            else:
-                selection_vector = None
-                print("Scipy Minimize Best Score:", min_eig_val_scipy)
-
-            # Store results
-            test_case_result['results']['Scipy Minimize'] = {
-                'execution_time': exec_time,
-                'best_score': min_eig_val_scipy,
                 'selection_vector': selection_vector
             }
 
