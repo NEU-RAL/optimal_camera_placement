@@ -69,7 +69,7 @@ def greedy_selection(
 
                     # Compute the Schur complement
                     total_size = temp_inf_mat.shape[0]
-                    pose_dim = 6  # Adjust if necessary
+                    pose_dim = 6
                     num_pose_elements = num_poses * pose_dim
                     measurement_dim = total_size - num_pose_elements
 
@@ -185,9 +185,10 @@ def frank_wolfe_optimization(
 
         # Update the current selection
         selection_cur = selection_cur + alpha * (s - selection_cur)
+        print(f"Objective value: {min_eig_val}")
 
         # Check for convergence
-        if abs(min_eig_val - prev_min_eig) < 1e-7:
+        if abs(min_eig_val - prev_min_eig) < 1e-4:
             print(f"Converged at iteration {iteration}")
             break
         prev_min_eig = min_eig_val
@@ -358,7 +359,7 @@ def min_eig_obj_with_jac(x, inf_mats, H0, num_poses):
     eigvals, eigvecs = np.linalg.eigh(H_schur)
     min_eig_index = np.argmin(eigvals)
     min_eig_val = eigvals[min_eig_index]
-    min_eig_vec = eigvecs[:, min_eig_index]  # Shape: (num_pose_elements,)
+    min_eig_vec = eigvecs[:, min_eig_index] 
 
     # Objective function value (negative smallest eigenvalue)
     f = -min_eig_val
@@ -421,7 +422,7 @@ def scipy_minimize(inf_mats, H0, selection_init, k, num_poses, A, b):
         jac=True,
         constraints=cons,
         bounds=bounds,
-        options={'disp': False}
+        options={'disp': True, 'maxiter': 1000, 'ftol': 1e-4}
     )
 
     # Get the minimum eigenvalue of the continuous solution
@@ -482,7 +483,7 @@ def min_eig_obj_lse_with_jac(x, inf_mats, H0, num_poses):
     # Stabilize weights computation using Log-Sum-Exp trick
     eigvals_shifted = eigvals - eigvals.min()  # Shift to prevent underflow
     scaled_exp_eigvals = np.exp(-beta * eigvals_shifted)
-    weight_sum = np.sum(scaled_exp_eigvals) + 1e-12  # Avoid division by zero
+    weight_sum = np.sum(scaled_exp_eigvals) + 1e-12  
     softmax_weights = scaled_exp_eigvals / weight_sum  # This is σ_α(x)
 
     # Compute the objective function value using the stabilized LSE approximation
@@ -549,7 +550,7 @@ def scipy_minimize_lse(inf_mats, H0, selection_init, num_poses, A, b):
         jac=True,
         constraints=cons,
         bounds=bounds,
-        options={'disp': False, 'maxiter': 1000, 'ftol': 1e-6}
+        options={'disp': True, 'maxiter': 1000, 'ftol': 1e-4}
     )
 
     # Get the approximated minimum eigenvalue of the continuous solution

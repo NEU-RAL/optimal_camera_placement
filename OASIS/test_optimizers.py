@@ -54,12 +54,12 @@ def time_function(func, *args, **kwargs):
 def run_tests():
     # Define pose and measurement dimensions
     pose_dim = 6  # Each pose has 6 variables
-    measurement_dim = 30  # Total measurement dimension
-
+    # measurement_dim = 934  # Total measurement dimension
+    measurement_dim = 10
     num_poses = 6
 
     # Define the list of num_matrices to test
-    num_matrices_list = [10, 100]
+    num_matrices_list = [1000]
 
     # Initialize a list to store the results
     results = []
@@ -154,86 +154,80 @@ def run_tests():
 
             print("\n" + "#" * 70)
 
-            # Run Scipy Optimization with Smoothing (LSE)
-            print("\nRunning Scipy Optimization with Smoothing (LSE)")
-            (selection_scipy_lse, approx_min_eig_val_scipy_lse), exec_time = time_function(
-                scipy_minimize_lse,
-                inf_mats=inf_mats,
-                H0=H0,
-                selection_init=selection_init,
-                num_poses=num_poses,
-                A=A,
-                b=b
-            )
-            if num_matrices == 10:
-                print("Scipy Optimization with Smoothing Results (selection vector):", selection_scipy_lse)
-                print("Scipy Optimization with Smoothing Best Score:", approx_min_eig_val_scipy_lse)
-                print("Scipy Minimize LSE Results (K - max):", roundsolution(selection_scipy_lse, k))
-                print("Scipy Minimize LSE Results (Breakties):", roundsolution_breakties(selection_scipy_lse, k, inf_mats, H0))
-                print("Scipy Minimize LSE Results (Madow):", roundsolution_madow(selection_scipy_lse, k))
-                selection_vector = selection_scipy_lse.tolist()
-            else:
-                selection_vector = None
-                print("Scipy Optimization with Smoothing Best Score:", approx_min_eig_val_scipy_lse)
+            # # Run Scipy Optimization with Smoothing (LSE)
+            # print("\nRunning Scipy Optimization with Smoothing (LSE)")
+            # (selection_scipy_lse, approx_min_eig_val_scipy_lse), exec_time = time_function(
+            #     scipy_minimize_lse,
+            #     inf_mats=inf_mats,
+            #     H0=H0,
+            #     selection_init=selection_init,
+            #     num_poses=num_poses,
+            #     A=A,
+            #     b=b
+            # )
+            # if num_matrices == 10:
+            #     print("Scipy Optimization with Smoothing Results (selection vector):", selection_scipy_lse)
+            #     print("Scipy Optimization with Smoothing Best Score:", approx_min_eig_val_scipy_lse)
+            #     print("Scipy Minimize LSE Results (K - max):", roundsolution(selection_scipy_lse, k))
+            #     print("Scipy Minimize LSE Results (Breakties):", roundsolution_breakties(selection_scipy_lse, k, inf_mats, H0))
+            #     print("Scipy Minimize LSE Results (Madow):", roundsolution_madow(selection_scipy_lse, k))
+            #     selection_vector = selection_scipy_lse.tolist()
+            # else:
+            #     selection_vector = None
+            #     print("Scipy Optimization with Smoothing Best Score:", approx_min_eig_val_scipy_lse)
 
-            # Store results
-            test_case_result['results']['Scipy Optimization with LSE'] = {
-                'execution_time': exec_time,
-                'best_score': approx_min_eig_val_scipy_lse,
-                'selection_vector': selection_vector
-            }
+            # # Store results
+            # test_case_result['results']['Scipy Optimization with LSE'] = {
+            #     'execution_time': exec_time,
+            #     'best_score': approx_min_eig_val_scipy_lse,
+            #     'selection_vector': selection_vector
+            # }
 
-            print("\n" + "#" * 70)
+            # print("\n" + "#" * 70)
 
-            # Run Frank-Wolfe Optimization only for num_matrices = 10 and 100
-            if num_matrices in [10, 100]:
-                n_iters = 10000 if num_matrices == 10 else 1000
-                print("\nRunning Frank-Wolfe Optimization")
-                (final_solution, min_eig_val_rounded, i), exec_time = time_function(
-                    frank_wolfe_optimization,
-                    inf_mats=inf_mats,
-                    prior=H0,
-                    n_iters=n_iters,
-                    selection_init=selection_init,
-                    k=k,
-                    num_poses=num_poses,
-                    A=A,
-                    b=b
-                )
-                if num_matrices == 10:
-                    print("Frank-Wolfe Optimization Results (selection vector):", final_solution)
-                    print("Frank-Wolfe Optimization Best Score:", min_eig_val_rounded)
-                    print("Frank-Wolfe Optimization Results (K - max):", roundsolution(final_solution, k))
-                    print("Frank-Wolfe Optimization Results (Breakties):", roundsolution_breakties(final_solution, k, inf_mats, H0))
-                    print("Frank-Wolfe Optimization Results (Madow):", roundsolution_madow(final_solution, k))
-                    selection_vector = final_solution.tolist()
-                else:
-                    selection_vector = None
-                    print("Frank-Wolfe Optimization Best Score:", min_eig_val_rounded)
+            # # Run Frank-Wolfe Optimization only for num_matrices = 10 and 100
+            # if num_matrices in [10, 100, 1000]:
+            #     n_iters = 10000 if num_matrices == 10 else 1000
+            #     print("\nRunning Frank-Wolfe Optimization")
+            #     (final_solution, min_eig_val_rounded, i), exec_time = time_function(
+            #         frank_wolfe_optimization,
+            #         inf_mats=inf_mats,
+            #         prior=H0,
+            #         n_iters=n_iters,
+            #         selection_init=selection_init,
+            #         k=k,
+            #         num_poses=num_poses,
+            #         A=A,
+            #         b=b
+            #     )
+            #     if num_matrices == 10:
+            #         print("Frank-Wolfe Optimization Results (selection vector):", final_solution)
+            #         print("Frank-Wolfe Optimization Best Score:", min_eig_val_rounded)
+            #         print("Frank-Wolfe Optimization Results (K - max):", roundsolution(final_solution, k))
+            #         print("Frank-Wolfe Optimization Results (Breakties):", roundsolution_breakties(final_solution, k, inf_mats, H0))
+            #         print("Frank-Wolfe Optimization Results (Madow):", roundsolution_madow(final_solution, k))
+            #         selection_vector = final_solution.tolist()
+            #     else:
+            #         selection_vector = None
+            #         print("Frank-Wolfe Optimization Best Score:", min_eig_val_rounded)
 
-                # Store results
-                test_case_result['results']['Frank-Wolfe Optimization'] = {
-                    'execution_time': exec_time,
-                    'best_score': min_eig_val_rounded,
-                    'selection_vector': selection_vector
-                }
+            #     # Store results
+            #     test_case_result['results']['Frank-Wolfe Optimization'] = {
+            #         'execution_time': exec_time,
+            #         'best_score': min_eig_val_rounded,
+            #         'selection_vector': selection_vector
+            #     }
 
-                print("\n" + "#" * 70)
-            else:
-                # print("Frank-Wolfe Optimization skipped for num_matrices =", num_matrices)
-                # Indicate that Frank-Wolfe was skipped
-                test_case_result['results']['Frank-Wolfe Optimization'] = {
-                    'skipped': True
-                }
+            #     print("\n" + "#" * 70)
+            # else:
+            #     # print("Frank-Wolfe Optimization skipped for num_matrices =", num_matrices)
+            #     # Indicate that Frank-Wolfe was skipped
+            #     test_case_result['results']['Frank-Wolfe Optimization'] = {
+            #         'skipped': True
+            #     }
 
             # Append the test case result to the results list
             results.append(test_case_result)
-
-    # Save results to a YAML file
-    with open('optimization_results.yaml', 'w') as yaml_file:
-        yaml.dump(results, yaml_file)
-
-    print("\nTesting complete.")
 
 if __name__ == "__main__":
     run_tests()
