@@ -304,8 +304,8 @@ def roundsolution_breakties(selection, k, all_mats, H0):
         # Compute the smallest eigenvalue of the matrix H0 + m for each candidate
         m_p = H0 + m
         assert utilities.check_symmetric(m_p)  # Ensure symmetry of the matrix
-        eigvals, _ = la.eigh(m_p)
-        all_eigs.append(eigvals[0])  # Store the smallest eigenvalue
+        eigval, _ = eigsh(m_p, k=1, which='SA')
+        all_eigs.append(eigval)  # Store the smallest eigenvalue
     all_eigs = np.array(all_eigs)
 
     # Combine selection scores and eigenvalues for tie-breaking
@@ -466,7 +466,7 @@ def min_eig_grad(x, inf_mats, H0, num_poses):
         grad[idx] = grad_value
     
     run_time = time.time() - start_time
-    print(f"jacobian call compute time: {run_time:.4f}")
+    #print(f"jacobian call compute time: {run_time:.4f}")
 
     return grad
 
