@@ -544,7 +544,7 @@ def min_eig_obj_lse_with_jac(x, inf_mats, H0, num_poses):
         combined_fim += xi * Hi
 
     # Extract submatrices based on the correct dimensions
-    pose_dim = 6  # Adjust as needed for your problem
+    pose_dim = 6
     num_pose_elements = num_poses * pose_dim
     total_size = combined_fim.shape[0]
     measurement_dim = total_size - num_pose_elements
