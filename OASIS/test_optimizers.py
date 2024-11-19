@@ -16,6 +16,8 @@ from optimizations import (
 )
 import FIM as fim
 import pandas as pd
+import os
+import datetime
 
 # Define Metric Enum for selection
 class Metric(Enum):
@@ -84,7 +86,7 @@ def run_tests():
     pose_dim = 6  # Each pose has 6 variables
     measurement_dim = 10  # Total measurement dimension
 
-    num_poses_list = [6]
+    num_poses_list = [10, 50, 100]
 
     # Define the list of num_matrices to test
     density = 0.05        # 5% non-zero elements
@@ -92,7 +94,7 @@ def run_tests():
 
     num_matrices_list = [10]
     # k_values
-    k_values = [2]
+    k_values = [5]
 
     # Initialize a list to store the results
     results = []
@@ -198,47 +200,47 @@ def run_tests():
                 # results_n_k[n_index, k_index, 1, 5] = 0
 
                 print("\n" + "#" * 70)
-                # Run Scipy Optimization with Smoothing (LSE)
-                print("\nRunning Scipy Optimization with Smoothing (LSE)")
-                (selection_scipy_lse, approx_min_eig_val_scipy_lse), exec_time = time_function(
-                    scipy_minimize_lse,
-                    inf_mats=inf_mats,
-                    H0=H0,
-                    selection_init=selection_init,
-                    num_poses=num_poses,
-                    A=A,
-                    b=b
-                )
-
-                print("Scipy Optimization with Smoothing Results (selection vector):", selection_scipy_lse)
-                print("Scipy Optimization with Smoothing Best Score:", approx_min_eig_val_scipy_lse)
-                k_max_sol_lse = roundsolution(selection_scipy_lse, k)
-                print("\nScipy Minimize LSE Results (K - max):", np.nonzero(k_max_sol_lse))
-                k_max_score_lse = fim.find_min_eig_pair(inf_mats, np.array(k_max_sol_lse), H0, num_poses)[0]
-                print("Scipy Minimize LSE (K - max) score:", k_max_score_lse)
-                breakties_sol_lse = roundsolution_breakties(selection_scipy_lse, k, inf_mats, H0)
-                print("\nScipy Minimize LSE Results (Breakties):", np.nonzero(breakties_sol_lse))
-                break_ties_score_lse = fim.find_min_eig_pair(inf_mats, np.array(breakties_sol_lse), H0, num_poses)[0]
-                print("Scipy Minimize LSE Breakties score:", break_ties_score_lse)
-                madow_sol_lse = roundsolution_madow(selection_scipy_lse, k)
-                print("\nScipy Minimize LSE Results (Madow):", np.nonzero((madow_sol_lse)))
-                madow_score_lse = fim.find_min_eig_pair(inf_mats, np.array(madow_sol_lse), H0, num_poses)[0]
-                print("Scipy Minimize LSE Madow score:", madow_score_lse)
-                selection_vector = selection_scipy_lse.tolist()
-
-
-                # Store results
-                test_case_result['results']['Scipy Optimization with LSE'] = {
-                    'execution_time': exec_time,
-                    'best_score': approx_min_eig_val_scipy_lse,
-                    'selection_vector': selection_vector
-                }
-                results_n_k[p_index, n_index, k_index, 2, 0] = approx_min_eig_val_scipy_lse
-                results_n_k[p_index, n_index, k_index, 2, 1] = k_max_score_lse
-                results_n_k[p_index, n_index, k_index, 2, 2] = break_ties_score_lse
-                results_n_k[p_index, n_index, k_index, 2, 3] = madow_score_lse
-                results_n_k[p_index, n_index, k_index, 2, 4] = exec_time
-                # results_n_k[n_index, k_index, 2, 5] = 0
+                # # Run Scipy Optimization with Smoothing (LSE)
+                # print("\nRunning Scipy Optimization with Smoothing (LSE)")
+                # (selection_scipy_lse, approx_min_eig_val_scipy_lse), exec_time = time_function(
+                #     scipy_minimize_lse,
+                #     inf_mats=inf_mats,
+                #     H0=H0,
+                #     selection_init=selection_init,
+                #     num_poses=num_poses,
+                #     A=A,
+                #     b=b
+                # )
+                #
+                # print("Scipy Optimization with Smoothing Results (selection vector):", selection_scipy_lse)
+                # print("Scipy Optimization with Smoothing Best Score:", approx_min_eig_val_scipy_lse)
+                # k_max_sol_lse = roundsolution(selection_scipy_lse, k)
+                # print("\nScipy Minimize LSE Results (K - max):", np.nonzero(k_max_sol_lse))
+                # k_max_score_lse = fim.find_min_eig_pair(inf_mats, np.array(k_max_sol_lse), H0, num_poses)[0]
+                # print("Scipy Minimize LSE (K - max) score:", k_max_score_lse)
+                # breakties_sol_lse = roundsolution_breakties(selection_scipy_lse, k, inf_mats, H0)
+                # print("\nScipy Minimize LSE Results (Breakties):", np.nonzero(breakties_sol_lse))
+                # break_ties_score_lse = fim.find_min_eig_pair(inf_mats, np.array(breakties_sol_lse), H0, num_poses)[0]
+                # print("Scipy Minimize LSE Breakties score:", break_ties_score_lse)
+                # madow_sol_lse = roundsolution_madow(selection_scipy_lse, k)
+                # print("\nScipy Minimize LSE Results (Madow):", np.nonzero((madow_sol_lse)))
+                # madow_score_lse = fim.find_min_eig_pair(inf_mats, np.array(madow_sol_lse), H0, num_poses)[0]
+                # print("Scipy Minimize LSE Madow score:", madow_score_lse)
+                # selection_vector = selection_scipy_lse.tolist()
+                #
+                #
+                # # Store results
+                # test_case_result['results']['Scipy Optimization with LSE'] = {
+                #     'execution_time': exec_time,
+                #     'best_score': approx_min_eig_val_scipy_lse,
+                #     'selection_vector': selection_vector
+                # }
+                # results_n_k[p_index, n_index, k_index, 2, 0] = approx_min_eig_val_scipy_lse
+                # results_n_k[p_index, n_index, k_index, 2, 1] = k_max_score_lse
+                # results_n_k[p_index, n_index, k_index, 2, 2] = break_ties_score_lse
+                # results_n_k[p_index, n_index, k_index, 2, 3] = madow_score_lse
+                # results_n_k[p_index, n_index, k_index, 2, 4] = exec_time
+                # # results_n_k[n_index, k_index, 2, 5] = 0
 
                 print("\n" + "#" * 70)
 
@@ -299,7 +301,22 @@ def run_tests():
                 # # Append the test case result to the results list
                 # results.append(test_case_result)
         #save the numpy array for specific number of poses (matrix size)
-    np.save("../results/results_p{}_n{}_k{}.pkl".format(len(num_poses_list), len(num_matrices_list), len(k_values)), results_n_k)
+    results_dir=os.path.join("results",datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    os.mkdir(results_dir)
+    # save results in an array
+    np.save(os.path.join(results_dir,"results_p{}_n{}_k{}.pkl".format(len(num_poses_list), len(num_matrices_list), len(k_values))), results_n_k)
+    #save the experiment configuration
+    exp_config={
+        "pose_dim": pose_dim,
+        "measurement_dim": measurement_dim,
+        "num_poses_list": num_poses_list,
+        "num_matrices_list": num_matrices_list,
+        "k_values": k_values,
+        "algos": ["greedy","scipy","scipy-lse","frank-wolfe"],
+        "metrics": ["unr_score", "k-max", "break-ties", "madow", "exec_time", "sub-opt-gap"] #sub-opt-gap not implemented
+    }
+    with open(os.path.join(results_dir, "exp_config.yaml"), "w") as f:
+        yaml.dump(exp_config, f)
 
 if __name__ == "__main__":
     run_tests()
