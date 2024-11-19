@@ -15,6 +15,7 @@ from optimizations import (
     roundsolution_madow
 )
 import FIM as fim
+import pandas as pd
 
 # Define Metric Enum for selection
 class Metric(Enum):
@@ -81,226 +82,224 @@ def time_function(func, *args, **kwargs):
 def run_tests():
     # Define pose and measurement dimensions
     pose_dim = 6  # Each pose has 6 variables
-    # measurement_dim = 934  # Total measurement dimension
-    measurement_dim = 10
-    num_poses = 6
+    measurement_dim = 10  # Total measurement dimension
+
+    num_poses_list = [6]
 
     # Define the list of num_matrices to test
     density = 0.05        # 5% non-zero elements
     min_eigenvalue = 5.0  # Minimum eigenvalue
 
-    num_matrices_list = [10, 100, 300]
+    num_matrices_list = [10]
+    # k_values
+    k_values = [2]
 
     # Initialize a list to store the results
     results = []
 
+    results_n_k = np.zeros((len(num_poses_list), len(num_matrices_list), len(k_values), 4, 6))
+
     # Iterate over the values of num_matrices
-    for num_matrices in num_matrices_list:
-        # Determine k_values based on num_matrices
-        if num_matrices == 10:
-            k_values = [5, 3]  # Test with k = 5 and k = 3 when num_matrices == 10
-        else:
-            k_values = [5, 3]      # Test only with k = 5 for other num_matrices
+    for p_index, num_poses in enumerate(num_poses_list):
+        #iterate over different matrix sizes
+        for n_index,num_matrices in enumerate(num_matrices_list):
+            # Calculate matrix size
+            matrix_size = measurement_dim + num_poses * pose_dim
+            # Generate synthetic data
+            inf_mats = generate_random_fim(num_matrices, matrix_size, density, min_eigenvalue)
+            H0 = diags([min_eigenvalue] * matrix_size, format='csr')
+            selection_init = np.ones(num_matrices, dtype=np.float16) / num_matrices
 
-        # Calculate matrix size
-        matrix_size = measurement_dim + num_poses * pose_dim
+            # Iterate over k_values
+            for k_index, k in enumerate(k_values):
+                # Constraint setup for optimization methods
+                A = csr_matrix(np.ones((1, num_matrices)))  # Create A as a sparse matrix
+                b = np.array([k])
 
-        # Generate synthetic data
-        inf_mats = generate_random_fim(num_matrices, matrix_size, density, min_eigenvalue)
+                print(f"\nRunning tests for matrix_size = {matrix_size},  num_matrices = {num_matrices}, k = {k}")
 
-        H0 = diags([min_eigenvalue] * matrix_size, format='csr')
-        selection_init = np.ones(num_matrices, dtype=np.float16) / num_matrices
+                # Dictionary to store results for this test case
+                test_case_result = {
+                    'num_matrices': num_matrices,
+                    'k': k,
+                    'results': {}
+                }
+                # Run Greedy Selection
+                print("\nRunning Greedy Selection")
+                (selection_vec, best_score, avail_cand), exec_time = time_function(
+                    greedy_selection,
+                    inf_mats=np.array(inf_mats),
+                    prior=H0,
+                    Nc=k,
+                    metric=Metric.MIN_EIG,
+                    num_runs=1,
+                    num_poses=num_poses
+                )
 
-        for k in k_values:
-            # Constraint setup for optimization methods
-            A = csr_matrix(np.ones((1, num_matrices)))  # Create A as a sparse matrix
-            b = np.array([k]) 
-
-            print(f"\nRunning tests for num_matrices = {num_matrices}, k = {k}")
-
-            # Dictionary to store results for this test case
-            test_case_result = {
-                'num_matrices': num_matrices,
-                'k': k,
-                'results': {}
-            }
-
-            # Run Scipy Minimize Optimization
-            print("\nRunning Scipy Minimize Optimization")
-            (continuous_sol_scipy, min_eig_val_scipy), exec_time = time_function(
-                scipy_minimize,
-                inf_mats=inf_mats,
-                H0=H0,
-                selection_init=selection_init,
-                k=k,
-                num_poses=num_poses,
-                A=A,
-                b=b
-            )
-            if num_matrices == 10:
-                print("Scipy Minimize Results (selection vector):", continuous_sol_scipy)
-                print("Scipy Minimize Best Score:", min_eig_val_scipy)
-                # print("Scipy Minimize Results (K - max):", roundsolution(continuous_sol_scipy, k))
-                # print("Scipy Minimize Results (Breakties):", roundsolution_breakties(continuous_sol_scipy, k, inf_mats, H0))
-                # print("Scipy Minimize Results (Madow):", roundsolution_madow(continuous_sol_scipy, k))
-                selection_vector = continuous_sol_scipy.tolist()
-            else:
-                selection_vector = None
-                print("Scipy Minimize Best Score:", min_eig_val_scipy)
-
-            # Store results
-            test_case_result['results']['Scipy Minimize'] = {
-                'execution_time': exec_time,
-                'best_score': min_eig_val_scipy,
-                'selection_vector': selection_vector
-            }
-
-            print("\n" + "#" * 70)
-
-            # Run Greedy Selection
-            print("\nRunning Greedy Selection")
-            (selection_vec, best_score, avail_cand), exec_time = time_function(
-                greedy_selection,
-                inf_mats=np.array(inf_mats),
-                prior=H0,
-                Nc=k,
-                metric=Metric.MIN_EIG,
-                num_runs=1,
-                num_poses=num_poses
-            )
-            if num_matrices != 500:
                 print("Greedy Selection Results (selection vector):", np.nonzero(selection_vec))
                 selection_vector = selection_vec.tolist()
-            else:
-                selection_vector = None
-            print("Greedy Selection Best Score:", best_score)
+                print("Greedy Selection Best Score:", best_score)
 
-            # Store results
-            test_case_result['results']['Greedy Selection'] = {
-                'execution_time': exec_time,
-                'best_score': best_score,
-                'selection_vector': selection_vector
-            }
+                # Store results
+                test_case_result['results']['Greedy Selection'] = {
+                    'execution_time': exec_time,
+                    'best_score': best_score,
+                    'selection_vector': selection_vector
+                }
+                results_n_k[p_index, n_index, k_index, 0, 0]= best_score
+                results_n_k[p_index, n_index, k_index, 0, 1]= best_score
+                results_n_k[p_index, n_index, k_index, 0, 2] = best_score
+                results_n_k[p_index, n_index, k_index, 0, 3] = best_score
+                results_n_k[p_index, n_index, k_index, 0, 4]= exec_time
+                # results_n_k[n_index, k_index, 0, 5]= 0
 
-            print("\n" + "#" * 70)
-            # Run Scipy Minimize Optimization
-            print("\nRunning Scipy Minimize Optimization")
-            (continuous_sol_scipy, min_eig_val_scipy), exec_time = time_function(
-                scipy_minimize,
-                inf_mats=inf_mats,
-                H0=H0,
-                selection_init=selection_init,
-                k=k,
-                num_poses=num_poses,
-                A=A,
-                b=b
-            )
-            if num_matrices != 500:
-                print("Scipy Minimize Results (selection vector):", continuous_sol_scipy)
-                print("Scipy Minimize Best Score unrounded:", min_eig_val_scipy)
-                k_max_sol = roundsolution(continuous_sol_scipy, k)
-                print("\nScipy Minimize Results (K - max):",np.nonzero(k_max_sol) )
-                print("Scipy Minimize (K - max) score:", fim.find_min_eig_pair(inf_mats, np.array(k_max_sol), H0, num_poses)[0])
-                break_ties_sol = roundsolution_breakties(continuous_sol_scipy, k, inf_mats, H0)
-                print("\nScipy Minimize Results (Breakties):", np.nonzero(break_ties_sol))
-                print("Scipy Minimize Breakties score:", fim.find_min_eig_pair(inf_mats, np.array(break_ties_sol), H0, num_poses)[0])
-                madow_sol = roundsolution_madow(continuous_sol_scipy, k)
-                print("\nScipy Minimize Results (Madow):",np.nonzero(madow_sol ))
-                print("Scipy Minimize madow score:",fim.find_min_eig_pair(inf_mats, np.array(madow_sol), H0, num_poses)[0])
-                selection_vector = continuous_sol_scipy.tolist()
-            else:
-                selection_vector = None
-                print("Scipy Minimize Best Score:", min_eig_val_scipy)
+                print("\n" + "#" * 70)
 
-            # # Store results
-            # test_case_result['results']['Scipy Optimization with LSE'] = {
-            #     'execution_time': exec_time,
-            #     'best_score': approx_min_eig_val_scipy_lse,
-            #     'selection_vector': selection_vector
-            # }
-
-            print("\n" + "#" * 70)
-
-            # Run Scipy Optimization with Smoothing (LSE)
-            print("\nRunning Scipy Optimization with Smoothing (LSE)")
-            (selection_scipy_lse, approx_min_eig_val_scipy_lse), exec_time = time_function(
-                scipy_minimize_lse,
-                inf_mats=inf_mats,
-                H0=H0,
-                selection_init=selection_init,
-                num_poses=num_poses,
-                A=A,
-                b=b
-            )
-            if num_matrices != 500:
-                print("Scipy Optimization with Smoothing Results (selection vector):", selection_scipy_lse)
-                print("Scipy Optimization with Smoothing Best Score:", approx_min_eig_val_scipy_lse)
-                k_max_sol_lse = roundsolution(selection_scipy_lse, k)
-                print("\nScipy Minimize LSE Results (K - max):", np.nonzero(k_max_sol_lse))
-                print("Scipy Minimize LSE (K - max) score:", fim.find_min_eig_pair(inf_mats, np.array(k_max_sol_lse), H0, num_poses)[0])
-                breakties_sol_lse = roundsolution_breakties(selection_scipy_lse, k, inf_mats, H0)
-                print("\nScipy Minimize LSE Results (Breakties):", np.nonzero(breakties_sol_lse))
-                print("Scipy Minimize LSE Breakties score:", fim.find_min_eig_pair(inf_mats, np.array(breakties_sol_lse), H0, num_poses)[0])
-                madow_sol_lse = roundsolution_madow(selection_scipy_lse, k)
-                print("\nScipy Minimize LSE Results (Madow):", np.nonzero((madow_sol_lse)))
-                print("Scipy Minimize LSE Madow score:", fim.find_min_eig_pair(inf_mats, np.array(madow_sol_lse), H0, num_poses)[0])
-                selection_vector = selection_scipy_lse.tolist()
-            else:
-                selection_vector = None
-                print("Scipy Optimization with Smoothing Best Score:", approx_min_eig_val_scipy_lse)
-
-            # Store results
-            test_case_result['results']['Scipy Optimization with LSE'] = {
-                'execution_time': exec_time,
-                'best_score': approx_min_eig_val_scipy_lse,
-                'selection_vector': selection_vector
-            }
-
-            print("\n" + "#" * 70)
-
-            # Run Frank-Wolfe Optimization only for num_matrices = 10 and 100
-            if num_matrices in [10, 100]:
-                n_iters = 10000 if num_matrices == 10 else 1000
-                print("\nRunning Frank-Wolfe Optimization")
-                (final_solution, min_eig_val_rounded, i), exec_time = time_function(
-                    frank_wolfe_optimization,
+                # Run Scipy Minimize Optimization
+                print("\nRunning Scipy Minimize Optimization")
+                (continuous_sol_scipy, min_eig_val_scipy), exec_time = time_function(
+                    scipy_minimize,
                     inf_mats=inf_mats,
-                    prior=H0,
-                    n_iters=n_iters,
+                    H0=H0,
                     selection_init=selection_init,
                     k=k,
                     num_poses=num_poses,
                     A=A,
                     b=b
                 )
-                if num_matrices == 10:
-                    print("Frank-Wolfe Optimization Results (selection vector):", final_solution)
-                    print("Frank-Wolfe Optimization Best Score:", min_eig_val_rounded)
-                    print("Frank-Wolfe Optimization Results (K - max):", np.nonzero(roundsolution(final_solution, k)))
-                    print("Frank-Wolfe Optimization Results (Breakties):", np.nonzero(roundsolution_breakties(final_solution, k, inf_mats, H0)))
-                    print("Frank-Wolfe Optimization Results (Madow):", np.nonzero(roundsolution_madow(final_solution, k)))
-                    selection_vector = final_solution.tolist()
-                else:
-                    selection_vector = None
-                    print("Frank-Wolfe Optimization Best Score:", min_eig_val_rounded)
 
-            #     # Store results
-            #     test_case_result['results']['Frank-Wolfe Optimization'] = {
-            #         'execution_time': exec_time,
-            #         'best_score': min_eig_val_rounded,
-            #         'selection_vector': selection_vector
-            #     }
+                print("Scipy Minimize Results (selection vector):", continuous_sol_scipy)
+                print("Scipy Minimize Best Score unrounded:", min_eig_val_scipy)
+                k_max_sol = roundsolution(continuous_sol_scipy, k)
+                print("\nScipy Minimize Results (K - max):",np.nonzero(k_max_sol) )
+                k_max_score = fim.find_min_eig_pair(inf_mats, np.array(k_max_sol), H0, num_poses)[0]
+                print("Scipy Minimize (K - max) score:",k_max_score )
+                break_ties_sol = roundsolution_breakties(continuous_sol_scipy, k, inf_mats, H0)
+                print("\nScipy Minimize Results (Breakties):", np.nonzero(break_ties_sol))
+                break_ties_score = fim.find_min_eig_pair(inf_mats, np.array(break_ties_sol), H0, num_poses)[0]
+                print("Scipy Minimize Breakties score:", break_ties_score)
+                madow_sol = roundsolution_madow(continuous_sol_scipy, k)
+                print("\nScipy Minimize Results (Madow):",np.nonzero(madow_sol ))
+                madow_score = fim.find_min_eig_pair(inf_mats, np.array(madow_sol), H0, num_poses)[0]
+                print("Scipy Minimize madow score:",madow_score)
+                selection_vector = continuous_sol_scipy.tolist()
 
-            #     print("\n" + "#" * 70)
-            # else:
-            #     # print("Frank-Wolfe Optimization skipped for num_matrices =", num_matrices)
-            #     # Indicate that Frank-Wolfe was skipped
-            #     test_case_result['results']['Frank-Wolfe Optimization'] = {
-            #         'skipped': True
-            #     }
+                # Store results
+                test_case_result['results']['Scipy Minimize'] = {
+                    'execution_time': exec_time,
+                    'best_score': min_eig_val_scipy,
+                    'selection_vector': selection_vector
+                }
+                results_n_k[p_index, n_index, k_index, 1, 0] = min_eig_val_scipy
+                results_n_k[p_index, n_index, k_index, 1, 1] = k_max_score
+                results_n_k[p_index, n_index, k_index, 1, 2] = break_ties_score
+                results_n_k[p_index, n_index, k_index, 1, 3] = madow_score
+                results_n_k[p_index, n_index, k_index, 1, 4]= exec_time
+                # results_n_k[n_index, k_index, 1, 5] = 0
 
-            # Append the test case result to the results list
-            results.append(test_case_result)
+                print("\n" + "#" * 70)
+                # Run Scipy Optimization with Smoothing (LSE)
+                print("\nRunning Scipy Optimization with Smoothing (LSE)")
+                (selection_scipy_lse, approx_min_eig_val_scipy_lse), exec_time = time_function(
+                    scipy_minimize_lse,
+                    inf_mats=inf_mats,
+                    H0=H0,
+                    selection_init=selection_init,
+                    num_poses=num_poses,
+                    A=A,
+                    b=b
+                )
+
+                print("Scipy Optimization with Smoothing Results (selection vector):", selection_scipy_lse)
+                print("Scipy Optimization with Smoothing Best Score:", approx_min_eig_val_scipy_lse)
+                k_max_sol_lse = roundsolution(selection_scipy_lse, k)
+                print("\nScipy Minimize LSE Results (K - max):", np.nonzero(k_max_sol_lse))
+                k_max_score_lse = fim.find_min_eig_pair(inf_mats, np.array(k_max_sol_lse), H0, num_poses)[0]
+                print("Scipy Minimize LSE (K - max) score:", k_max_score_lse)
+                breakties_sol_lse = roundsolution_breakties(selection_scipy_lse, k, inf_mats, H0)
+                print("\nScipy Minimize LSE Results (Breakties):", np.nonzero(breakties_sol_lse))
+                break_ties_score_lse = fim.find_min_eig_pair(inf_mats, np.array(breakties_sol_lse), H0, num_poses)[0]
+                print("Scipy Minimize LSE Breakties score:", break_ties_score_lse)
+                madow_sol_lse = roundsolution_madow(selection_scipy_lse, k)
+                print("\nScipy Minimize LSE Results (Madow):", np.nonzero((madow_sol_lse)))
+                madow_score_lse = fim.find_min_eig_pair(inf_mats, np.array(madow_sol_lse), H0, num_poses)[0]
+                print("Scipy Minimize LSE Madow score:", madow_score_lse)
+                selection_vector = selection_scipy_lse.tolist()
+
+
+                # Store results
+                test_case_result['results']['Scipy Optimization with LSE'] = {
+                    'execution_time': exec_time,
+                    'best_score': approx_min_eig_val_scipy_lse,
+                    'selection_vector': selection_vector
+                }
+                results_n_k[p_index, n_index, k_index, 2, 0] = approx_min_eig_val_scipy_lse
+                results_n_k[p_index, n_index, k_index, 2, 1] = k_max_score_lse
+                results_n_k[p_index, n_index, k_index, 2, 2] = break_ties_score_lse
+                results_n_k[p_index, n_index, k_index, 2, 3] = madow_score_lse
+                results_n_k[p_index, n_index, k_index, 2, 4] = exec_time
+                # results_n_k[n_index, k_index, 2, 5] = 0
+
+                print("\n" + "#" * 70)
+
+                # Run Frank-Wolfe Optimization only for num_matrices = 10 and 100
+                # if num_matrices in [10, 100, 300]:
+                #     n_iters = 10000 if num_matrices == 10 else 1000
+                #     print("\nRunning Frank-Wolfe Optimization")
+                #     (final_solution, min_eig_val_unrounded, i), exec_time = time_function(
+                #         frank_wolfe_optimization,
+                #         inf_mats=inf_mats,
+                #         prior=H0,
+                #         n_iters=n_iters,
+                #         selection_init=selection_init,
+                #         k=k,
+                #         num_poses=num_poses,
+                #         A=A,
+                #         b=b
+                #     )
+                #
+                #     print("Frank-Wolfe Optimization Results (selection vector):", final_solution)
+                #     print("Frank-Wolfe Optimization Best Score:", min_eig_val_unrounded)
+                #     k_max_sol_fw = roundsolution(final_solution, k)
+                #     print("Frank-Wolfe Optimization Results (K - max):", np.nonzero(k_max_sol_fw))
+                #     k_max_score_fw = fim.find_min_eig_pair(inf_mats, np.array(k_max_sol_fw), H0, num_poses)[0]
+                #     print("Frank-Wolfe  (K - max) score:", k_max_score_fw)
+                #     breakties_sol_fw = roundsolution_breakties(final_solution, k, inf_mats, H0)
+                #     print("Frank-Wolfe Optimization Results (Breakties):", np.nonzero(breakties_sol_fw))
+                #     break_ties_score_fw = fim.find_min_eig_pair(inf_mats, np.array(breakties_sol_fw), H0, num_poses)[0]
+                #     print("Frank-WolfeBreakties score:", break_ties_score_fw)
+                #     madow_sol_fw = roundsolution_madow(final_solution, k)
+                #     print("Frank-Wolfe Optimization Results (Madow):", np.nonzero(madow_sol_fw))
+                #     madow_score_fw = fim.find_min_eig_pair(inf_mats, np.array(madow_sol_fw), H0, num_poses)[0]
+                #     print("Frank-Wolfe Madow score:", madow_score_fw)
+                #     selection_vector = final_solution.tolist()
+                #
+                #
+                #     # Store results
+                #     test_case_result['results']['Frank-Wolfe Optimization'] = {
+                #         'execution_time': exec_time,
+                #         'best_score': min_eig_val_unrounded,
+                #         'selection_vector': selection_vector
+                #     }
+                #     results_n_k[p_index, n_index, k_index, 3, 0] = min_eig_val_unrounded
+                #     results_n_k[p_index, n_index, k_index, 3, 1] = k_max_score_fw
+                #     results_n_k[p_index, n_index, k_index, 3, 2] = break_ties_score_fw
+                #     results_n_k[p_index, n_index, k_index, 3, 3] = madow_score_fw
+                #     results_n_k[p_index, n_index, k_index, 3, 4] = exec_time
+                #     # results_n_k[n_index, k_index, 2, 5] = 0
+                #
+                #     print("\n" + "#" * 70)
+                # else:
+                #     # print("Frank-Wolfe Optimization skipped for num_matrices =", num_matrices)
+                #     # Indicate that Frank-Wolfe was skipped
+                #     test_case_result['results']['Frank-Wolfe Optimization'] = {
+                #         'skipped': True
+                #     }
+                #
+                # # Append the test case result to the results list
+                # results.append(test_case_result)
+        #save the numpy array for specific number of poses (matrix size)
+    np.save("../results/results_p{}_n{}_k{}.pkl".format(len(num_poses_list), len(num_matrices_list), len(k_values)), results_n_k)
 
 if __name__ == "__main__":
     run_tests()

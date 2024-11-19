@@ -511,8 +511,7 @@ def scipy_minimize(inf_mats, H0, selection_init, k, num_poses, A, b):
         jac=grad_fun,
         constraints=[linear_constraint], 
         bounds=bounds,  # Provide bounds
-        options={'disp': True, 'maxiter': 10000, 'ftol': 1e-2} 
-    )
+        options={'disp': True, 'maxiter': 10000, 'ftol': 1e-2} )
 
     # Get the minimum eigenvalue of the continuous solution
     min_eig_val_unr, _, _ = infmat.find_min_eig_pair(inf_mats, res.x, H0, num_poses)
