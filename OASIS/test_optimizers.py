@@ -89,7 +89,6 @@ def run_tests():
     density = 0.05        # 5% non-zero elements
     min_eigenvalue = 5.0  # Minimum eigenvalue
 
-
     # Initialize a list to store the results
     results = []
 
@@ -214,7 +213,7 @@ def run_tests():
 
             # print("\n" + "#" * 70)
 
-            # # Run Frank-Wolfe Optimization only for num_matrices = 10 and 100
+            # Run Frank-Wolfe Optimization only for num_matrices = 10 and 100
             # if num_matrices in [10, 100, 1000]:
             #     n_iters = 10000 if num_matrices == 10 else 1000
             #     print("\nRunning Frank-Wolfe Optimization")
@@ -232,9 +231,9 @@ def run_tests():
             #     if num_matrices == 10:
             #         print("Frank-Wolfe Optimization Results (selection vector):", final_solution)
             #         print("Frank-Wolfe Optimization Best Score:", min_eig_val_rounded)
-            #         print("Frank-Wolfe Optimization Results (K - max):", roundsolution(final_solution, k))
-            #         print("Frank-Wolfe Optimization Results (Breakties):", roundsolution_breakties(final_solution, k, inf_mats, H0))
-            #         print("Frank-Wolfe Optimization Results (Madow):", roundsolution_madow(final_solution, k))
+            #         # print("Frank-Wolfe Optimization Results (K - max):", roundsolution(final_solution, k))
+            #         # print("Frank-Wolfe Optimization Results (Breakties):", roundsolution_breakties(final_solution, k, inf_mats, H0))
+            #         # print("Frank-Wolfe Optimization Results (Madow):", roundsolution_madow(final_solution, k))
             #         selection_vector = final_solution.tolist()
             #     else:
             #         selection_vector = None
