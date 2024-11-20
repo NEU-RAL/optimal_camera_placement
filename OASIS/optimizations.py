@@ -21,7 +21,7 @@ from joblib import Parallel, delayed
 import scipy.sparse as sp
 from functools import partial
 import time
-
+from gurobipy import Model, GRB, quicksum
 
 L = gtsam.symbol_shorthand.L
 X = gtsam.symbol_shorthand.X
@@ -63,7 +63,7 @@ def compute_schur_complement(x, inf_mats, H0, num_poses):
 
     # Compute Schur complement
     try:
-        X = spsolve(Hll, Hlx)
+        X = spsolve(Hll.tocsc(), Hlx.tocsc())
     except Exception as e:
         print("Linear solver failed:", e)
         X = Hll.inverse().dot(Hlx).toarray()
@@ -186,82 +186,142 @@ def greedy_selection(
     return selection_vector, best_score, avail_cand
 
 
-def solve_lmo(grad, A, b, k):
+def solve_lmo(grad, A, b):
+    """
+    Solves the Linear Minimization Oracle (LMO) problem for Frank-Wolfe optimization.
+
+    Args:
+        grad (np.ndarray): Gradient vector (objective coefficients for the linear program).
+        A (np.ndarray or scipy.sparse.csr_matrix): Inequality constraint matrix.
+        b (np.ndarray): Inequality constraint bounds.
+
+    Returns:
+        np.ndarray or None: Solution vector if the optimization succeeds; otherwise, None.
+    """
     num_sensors = len(grad)
-    c = grad
+
+    # Define bounds for all variables between 0 and 1
     bounds = [(0, 1) for _ in range(num_sensors)]
-    A_eq = [np.ones(num_sensors)]
-    b_eq = [k]
-    res = linprog(c, A_ub=A, b_ub=b, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
+
+    # Use `linprog` from scipy to solve the LMO
+    res = linprog(c=grad, A_ub=A, b_ub=b, bounds=bounds, method='highs')
+
     if res.success:
         return res.x
     else:
-        print("LMO failed to find a feasible solution.")
+        print(f"LMO failed: {res.message}")
         return None
 
 
 def frank_wolfe_optimization(
     inf_mats: List[csr_matrix],
-    prior: csr_matrix,
-    n_iters: int,
+    H0: csr_matrix,
     selection_init: np.ndarray,
-    k: int,
     num_poses: int,
     A: np.ndarray,
     b: np.ndarray
 ) -> Tuple[np.ndarray, float, int]:
-    selection_cur = csr_matrix(selection_init)
-    prev_min_eig = float('inf')
+    """
+    Performs Frank-Wolfe optimization to select sensors that maximize the smallest eigenvalue of the Schur complement.
 
-    for iteration in range(n_iters):
-        # Compute the minimum eigenvalue and eigenvector
-        min_eig_val, min_eig_vec, final_inf_mat = infmat.find_min_eig_pair(
-            inf_mats, selection_cur.toarray(), prior, num_poses
-        )
+    Args:
+        inf_mats (List[csr_matrix]): List of sparse information matrices.
+        prior (csr_matrix): Prior information matrix.
+        n_iters (int): Number of iterations.
+        selection_init (np.ndarray): Initial selection vector.
+        k (int): Number of sensors to select.
+        num_poses (int): Number of poses.
+        A (np.ndarray): Inequality constraint matrix.
+        b (np.ndarray): Inequality constraint bounds.
 
-        # Compute gradient components
-        total_size = final_inf_mat.shape[0]
-        pose_dim = 6  # Adjust as needed
-        measurement_dim = total_size - num_poses * pose_dim
+    Returns:
+        Tuple[np.ndarray, float, int]: Final selection vector, best score (smallest eigenvalue), and number of iterations.
+    """
 
-        Hll = final_inf_mat[:measurement_dim, :measurement_dim]
-        Hlx = final_inf_mat[:measurement_dim, measurement_dim:]
-        Hxx = final_inf_mat[measurement_dim:, measurement_dim:]
+    H0 = H0.tocsc()
+    inf_mats = [Hi.tocsc() for Hi in inf_mats]
+    
+    # Convert A to CSC format
+    A = sp.csc_matrix(A)
+    # Initialize selection vector as a continuous variable (float)
+    selection_cur = selection_init.copy().astype(float)
+    prev_min_eig = -np.inf  # Initialize to negative infinity for maximization
+    
+    for iteration in range(1000):
+        # Combine the Fisher Information Matrices based on current selection
+        combined_fim = H0.copy().tocsc()
+        for idx, sel in enumerate(selection_cur):
+            combined_fim += sel * inf_mats[idx]
+        
+        # Compute the Schur complement and minimum eigenvalue
+        try:
+            pose_dim = 6  # Adjust if different
+            num_pose_elements = num_poses * pose_dim
+            total_size = combined_fim.shape[0]
+            measurement_dim = total_size - num_pose_elements
 
-        Hll_inv = inv(Hll) if scipy.sparse.issparse(Hll) else np.linalg.pinv(Hll)
-        t2 = Hlx.T @ Hll_inv
+            Hll = combined_fim[:measurement_dim, :measurement_dim].tocsc()
+            Hlx = combined_fim[:measurement_dim, measurement_dim:].tocsc()
+            Hxx = combined_fim[measurement_dim:, measurement_dim:].tocsc()
 
-        # Compute gradient
-        results = Parallel(n_jobs=-1)(
-            delayed(compute_grad_parallel)(
-                idx, Hc, Hll_inv, t2, Hlx, min_eig_vec, measurement_dim
-            )
-            for idx, Hc in enumerate(inf_mats)
-        )
+            # Solve Hll * X = Hlx
+            X = spsolve(Hll, Hlx).toarray()
 
-        grad = np.zeros(len(selection_init))
-        for idx, grad_value in results:
-            grad[idx] = grad_value
+            # Compute Schur complement
+            H_schur = Hxx - Hlx.transpose().dot(X)
 
-        # Solve the LMO
-        s = solve_lmo(grad, A, b, k)
-        if s is None:
-            print("LMO failed to find a feasible solution.")
+            # Ensure symmetry
+            H_schur = (H_schur + H_schur.T) / 2
+
+            # Compute the smallest eigenvalue and corresponding eigenvector
+            min_eig_val, min_eig_vec = eigsh(H_schur, k=1, which='SA')
+            min_eig_val = min_eig_val[0]
+            min_eig_vec = min_eig_vec[:, 0]
+        except Exception as e:
+            print(f"Error during Schur complement or eigenvalue computation at iteration {iteration}: {e}")
             break
 
-        # Convert to sparse
-        s = csr_matrix(s)
-        selection_cur = selection_cur + alpha * (s - selection_cur)
-
-        # Convergence check
+        # Check for convergence
         if abs(min_eig_val - prev_min_eig) < 1e-4:
             print(f"Converged at iteration {iteration}")
             break
         prev_min_eig = min_eig_val
 
-    # Final solution
-    selection_cur = selection_cur.toarray()
+        # Compute gradient
+        try:
+            H_schur, min_eig_vec, Hll, X = compute_schur_complement(selection_cur, inf_mats, H0, num_poses)
+            # Precompute constants for gradient
+            t2 = X.transpose()
+
+            # Parallelized gradient computation
+            measurement_dim = Hll.shape[0]
+            results = Parallel(n_jobs=-1)(
+                delayed(compute_grad_parallel)(idx, Hi, Hll, X, t2, min_eig_vec, measurement_dim)
+                for idx, Hi in enumerate(inf_mats)
+            )
+
+            grad = np.zeros_like(selection_cur)
+            for idx, grad_value in results:
+                grad[idx] = grad_value
+        except Exception as e:
+            print(f"Error during gradient computation at iteration {iteration}: {e}")
+            break
+
+        # Solve the Linear Minimization Oracle (LMO)
+        s = solve_lmo(grad, A, b)
+        if s is None:
+            print(f"LMO failed to find a feasible solution at iteration {iteration}.")
+            break
+
+        # Update step size (classic Frank-Wolfe step size: 2/(t+2))
+        alpha = 2 / (iteration + 2)
+
+        # Update the selection vector
+        selection_cur = selection_cur + alpha * (s - selection_cur)
+        selection_cur = np.clip(selection_cur, 0, 1)
+
     return selection_cur, min_eig_val, iteration + 1
+
 
 def roundsolution(selection, k):
     """
@@ -300,22 +360,71 @@ def roundsolution_breakties(selection, k, all_mats, H0):
     """
     s_rnd = np.round(selection, decimals=5)
     all_eigs = []
-    for m in all_mats:
+    for i, m in enumerate(all_mats):
         # Compute the smallest eigenvalue of the matrix H0 + m for each candidate
         m_p = H0 + m
-        assert utilities.check_symmetric(m_p)  # Ensure symmetry of the matrix
-        eigval, _ = eigsh(m_p, k=1, which='SA')
-        all_eigs.append(eigval)  # Store the smallest eigenvalue
+
+        # Ensure symmetry
+        m_p = (m_p + m_p.T) / 2  # Enforce numerical symmetry
+
+        # Add a small regularization term for stability
+        reg_term = 1e-8 * np.eye(m_p.shape[0])
+        m_p += reg_term
+
+        try:
+            # Attempt sparse computation of the smallest eigenvalue
+            eigval, _ = eigsh(m_p, k=1, which='SA', maxiter=2000)
+        except Exception as e:
+            print(f"ARPACK failed for matrix {i}, falling back to dense computation: {e}")
+            if m_p.shape[0] <= 1000:  # Use dense computation for smaller matrices
+                eigvals = np.linalg.eigh(m_p)[0]
+                eigval = eigvals[:1]  # Take the smallest eigenvalue
+            else:
+                raise RuntimeError(f"Eigenvalue computation failed for large matrix {i}")
+
+        all_eigs.append(eigval[0])  # Store the smallest eigenvalue
     all_eigs = np.array(all_eigs)
 
     # Combine selection scores and eigenvalues for tie-breaking
-    zipped_vals = np.array([(s_rnd[i], all_eigs[i]) for i in range(len(s_rnd))], dtype=[('w', 'float'), ('weight', 'float')])
+    zipped_vals = np.array([(s_rnd[i], all_eigs[i]) for i in range(len(s_rnd))],
+                           dtype=[('w', 'float'), ('weight', 'float')])
     idx = np.argpartition(zipped_vals, -k, order=['w', 'weight'])[-k:]
-    
+
     rounded_sol = np.zeros(len(s_rnd))
     if k > 0:
         rounded_sol[idx] = 1.0
     return rounded_sol
+
+
+# def roundsolution_madow(selection, k):
+#     """
+#     Implements a weighted probabilistic rounding to select `k` elements
+#     while preserving the relative importance of the `selection` scores.
+
+#     Args:
+#         selection (np.ndarray): Array of selection scores for each candidate (non-negative values).
+#         k (int): Number of elements to select.
+
+#     Returns:
+#         np.ndarray: Binary vector with exactly `k` elements selected probabilistically based on their weights.
+#     """
+#     num = len(selection)
+#     if k > num:
+#         raise ValueError("k cannot be greater than the number of candidates.")
+    
+#     # Normalize the selection scores to form probabilities
+#     normalized_selection = selection / np.sum(selection)
+
+#     # Perform weighted random sampling without replacement
+#     selected_indices = np.random.choice(
+#         np.arange(num), size=k, replace=False, p=normalized_selection
+#     )
+
+#     # Construct the binary solution vector
+#     rounded_sol = np.zeros(num, dtype=int)
+#     rounded_sol[selected_indices] = 1
+
+#     return rounded_sol
 
 def roundsolution_madow(selection, k):
     """
@@ -396,7 +505,7 @@ def compute_grad_parallel(idx, Hi, Hll, X, t2, min_eig_vec, measurement_dim):
 
     # Compute grad_schur = Hxx_i - Hlx_i^T * X - t2 * Hll_i * Y + t2 * Hlx_i
     try:
-        Y = spsolve(Hll, Hlx_i)
+        Y = spsolve(Hll, Hlx_i.tocsc())
     except Exception as e:
         print(f"Linear solver failed for Hi index {idx}:", e)
         Y = inv(Hll).dot(Hlx_i)  # Sparse fallback
@@ -470,7 +579,7 @@ def min_eig_grad(x, inf_mats, H0, num_poses):
 
     return grad
 
-def scipy_minimize(inf_mats, H0, selection_init, k, num_poses, A, b):
+def scipy_minimize(inf_mats, H0, selection_init, num_poses, A, b):
     """
     Uses `scipy.optimize.minimize` with inequality constraints to solve a sensor selection problem.
     The objective is to maximize the smallest eigenvalue of the FIM.
@@ -494,11 +603,6 @@ def scipy_minimize(inf_mats, H0, selection_init, k, num_poses, A, b):
     # Define linear constraint Ax <= b
     linear_constraint = LinearConstraint(A, -np.inf, b)
 
-
-    # Define a callable that returns the identity matrix
-    def hess_identity_callable(x):
-        return identity(len(x), format='csr')
-
     # Partial functions for objective and gradient
     obj_fun = partial(min_eig_obj, inf_mats=inf_mats, H0=H0, num_poses=num_poses)
     grad_fun = partial(min_eig_grad, inf_mats=inf_mats, H0=H0, num_poses=num_poses)
@@ -511,7 +615,7 @@ def scipy_minimize(inf_mats, H0, selection_init, k, num_poses, A, b):
         jac=grad_fun,
         constraints=[linear_constraint], 
         bounds=bounds,  # Provide bounds
-        options={'disp': True, 'maxiter': 10000, 'ftol': 1e-2} )
+        options={'disp': True, 'maxiter': 10000, 'ftol': 1e-4} )
 
     # Get the minimum eigenvalue of the continuous solution
     min_eig_val_unr, _, _ = infmat.find_min_eig_pair(inf_mats, res.x, H0, num_poses)
@@ -523,126 +627,235 @@ def scipy_minimize(inf_mats, H0, selection_init, k, num_poses, A, b):
 Scipy optimization methods with Log sum exponential
 '''
 
-def min_eig_obj_lse_with_jac(x, inf_mats, H0, num_poses):
+def min_eig_obj_lse(x, inf_mats, H0, num_poses, beta=5.0):
     """
-    Computes the objective function and its Jacobian (gradient) using the Log-Sum-Exp approximation.
-    The objective is the negative of the approximated smallest eigenvalue of the information matrix.
-
-    Args:
-        x (np.ndarray): Continuous selection vector.
-        inf_mats (List[np.ndarray]): List of information matrices for each sensor.
-        H0 (np.ndarray): Prior information matrix.
-        num_poses (int): Number of poses.
-
-    Returns:
-        Tuple[float, np.ndarray]: The objective function value and its gradient with respect to x.
+    Computes the objective function value using the Log-Sum-Exp (LSE) approximation.
     """
-    # Build the combined information matrix based on the selected sensors
-    combined_fim = H0.copy()
-    for xi, Hi in zip(x, inf_mats):
-        combined_fim += xi * Hi
+    # Use the helper function to compute the Schur complement and auxiliary matrices
+    H_schur, _, _, _ = compute_schur_complement(x, inf_mats, H0, num_poses)
 
-    # Extract submatrices based on the correct dimensions
-    pose_dim = 6
-    num_pose_elements = num_poses * pose_dim
-    total_size = combined_fim.shape[0]
-    measurement_dim = total_size - num_pose_elements
-
-    Hll = combined_fim[:measurement_dim, :measurement_dim]
-    Hlx = combined_fim[:measurement_dim, measurement_dim:]
-    Hxx = combined_fim[measurement_dim:, measurement_dim:]
-
-    # Compute the inverse of Hll (ensure it's invertible)
+    # Compute all eigenvalues of H_schur
     try:
-        Hll_inv = np.linalg.inv(Hll)
-    except np.linalg.LinAlgError:
-        Hll_inv = np.linalg.pinv(Hll)
-        print("Warning: Hll is singular; using pseudoinverse.")
+        if H_schur.shape[0] <= 500:  # Threshold to determine when to switch to dense
+            # Convert sparse matrix to dense for full eigenvalue computation
+            eigvals, _ = np.linalg.eigh(H_schur.toarray())
+        else:
+            # For very large matrices, use eigsh for performance and check fallback
+            eigvals, _ = eigsh(H_schur, k=H_schur.shape[0] - 1, which="SA")
+    except Exception as e:
+        print(f"Eigenvalue computation failed: {e}")
+        return np.inf 
 
-    # Compute the Schur complement
-    H_schur = Hxx - Hlx.T @ Hll_inv @ Hlx
-    # Ensure H_schur is symmetric
-    H_schur = (H_schur + H_schur.T) / 2
-
-    # Compute all eigenvalues and eigenvectors of H_schur
-    eigvals, eigvecs = np.linalg.eigh(H_schur)
-    beta = 5.0 
-
-    # Stabilize weights computation using Log-Sum-Exp trick
-    eigvals_shifted = eigvals - eigvals.min()  # Shift to prevent underflow
+    # Stabilize Log-Sum-Exp computation
+    eigvals_shifted = eigvals - eigvals.min()  # Shift to stabilize
     scaled_exp_eigvals = np.exp(-beta * eigvals_shifted)
-    weight_sum = np.sum(scaled_exp_eigvals) + 1e-12  
-    softmax_weights = scaled_exp_eigvals / weight_sum  # This is σ_α(x)
+    weight_sum = np.sum(scaled_exp_eigvals) + 1e-12
 
-    # Compute the objective function value using the stabilized LSE approximation
+    # Objective value using Log-Sum-Exp
     f = (-1 / beta) * np.log(weight_sum) + eigvals.min()
+    return -f
 
-    # Compute the gradient
-    grad = np.zeros_like(x)
-    for idx, H_j in enumerate(inf_mats):
-        # Build the Schur complement of H_j
-        Hll_j = H_j[:measurement_dim, :measurement_dim]
-        Hlx_j = H_j[:measurement_dim, measurement_dim:]
-        Hxx_j = H_j[measurement_dim:, measurement_dim:]
+def min_eig_grad_lse(x, inf_mats, H0, num_poses, beta=5.0):
+    """
+    Computes the gradient of the objective function using the Log-Sum-Exp (LSE) approximation.
+    """
+    # Use the helper function to compute the Schur complement and auxiliary matrices
+    H_schur, min_eig_vec, Hll, X = compute_schur_complement(x, inf_mats, H0, num_poses)
+
+    # Compute eigenvalues and eigenvectors
+    try:
+        if H_schur.shape[0] <= 500:
+            eigvals, eigvecs = np.linalg.eigh(H_schur.toarray())
+        else:
+            eigvals, eigvecs = eigsh(H_schur, k=H_schur.shape[0] - 1, which="SA")
+    except Exception as e:
+        print(f"Eigenvalue computation failed: {e}")
+        return np.zeros_like(x)  # Return zero gradient if computation fails
+
+    eigvals_shifted = eigvals - eigvals.min()  # Stabilize
+    scaled_exp_eigvals = np.exp(-beta * eigvals_shifted)
+    weight_sum = np.sum(scaled_exp_eigvals) + 1e-12
+    softmax_weights = scaled_exp_eigvals / weight_sum
+
+    # Parallelized gradient computation
+    def compute_grad_lse(idx, H_j, eigvecs, softmax_weights):
+        Hll_j = H_j[:Hll.shape[0], :Hll.shape[0]].tocsc()
+        Hlx_j = H_j[:Hll.shape[0], Hll.shape[0]:].tocsc()
+        Hxx_j = H_j[Hll.shape[0]:, Hll.shape[0]:].tocsc()
 
         try:
-            Hll_j_inv = np.linalg.inv(Hll_j)
-        except np.linalg.LinAlgError:
-            Hll_j_inv = np.linalg.pinv(Hll_j)
-            print(f"Warning: Hll_j is singular at index {idx}; using pseudoinverse.")
+            Hll_j_inv = spsolve(Hll, sp.identity(Hll.shape[0]).tocsc())
+        except Exception as e:
+            print(f"Linear solver failed for H_j index {idx}: {e}")
+            Hll_j_inv = Hll.inverse()
 
         H_schur_j = Hxx_j - Hlx_j.T @ Hll_j_inv @ Hlx_j
-        # Ensure H_schur_j is symmetric
-        H_schur_j = (H_schur_j + H_schur_j.T) / 2
+        H_schur_j = (H_schur_j + H_schur_j.T) / 2  # Ensure symmetry
 
-        # Compute derivative of eigenvalues with respect to x_j
         lambda_derivatives = np.array([
             eigvecs[:, i].T @ H_schur_j @ eigvecs[:, i]
             for i in range(len(eigvals))
         ])
+        return idx, np.sum(softmax_weights * lambda_derivatives)
 
-        # Compute gradient component using softmax weights
-        grad[idx] = np.sum(softmax_weights * lambda_derivatives)
+    results = Parallel(n_jobs=-1)(
+        delayed(compute_grad_lse)(idx, H_j, eigvecs, softmax_weights)
+        for idx, H_j in enumerate(inf_mats)
+    )
 
-    return -f, -grad
+    # Collect results into the gradient vector
+    grad = np.zeros_like(x)
+    for idx, grad_value in results:
+        grad[idx] = grad_value
+
+    return -grad
 
 def scipy_minimize_lse(inf_mats, H0, selection_init, num_poses, A, b):
     """
-    Uses `scipy.optimize.minimize` with inequality constraints to solve a sensor selection problem.
-    The objective is to maximize the smallest eigenvalue approximation using the Log-Sum-Exp method.
-
-    Args:
-        inf_mats (List[np.ndarray]): List of information matrices for each candidate sensor configuration.
-        H0 (np.ndarray): Prior information matrix.
-        selection_init (np.ndarray): Initial continuous selection vector.
-        num_poses (int): Number of poses in the problem.
-        A (np.ndarray): Matrix defining inequality constraints.
-        b (np.ndarray): Vector defining inequality constraints.
-
-    Returns:
-        Tuple[np.ndarray, float]: Continuous solution vector, approximated maximum minimum eigenvalue.
+    Uses `scipy.optimize.minimize` with inequality constraints to solve a sensor selection problem
+    using the Log-Sum-Exp (LSE) approximation, separating the objective and gradient calculations.
     """
-    # Set bounds for each variable in x (between 0 and 1) to represent selection probabilities
+    # Set bounds for each variable in x (between 0 and 1)
     bounds = [(0, 1) for _ in range(selection_init.shape[0])]
 
-    # Define constraints to include inequality constraints
-    cons = [
-        {'type': 'ineq', 'fun': lambda x: b - A @ x}     # Inequality constraints Ax <= b
-    ]
+    # Define constraints
+    cons = [{'type': 'ineq', 'fun': lambda x: b - A @ x}]
 
-    # Optimization function that maximizes the smallest eigenvalue approximation
+    # Define objective and gradient as separate functions
+    def objective(x):
+        return min_eig_obj_lse(x, inf_mats, H0, num_poses)
+
+    def gradient(x):
+        return min_eig_grad_lse(x, inf_mats, H0, num_poses)
+
+    # Optimization function
     res = minimize(
-        fun=lambda x: min_eig_obj_lse_with_jac(x, inf_mats, H0, num_poses),
+        fun=objective,
         x0=selection_init,
         method='SLSQP',
-        jac=True,
+        jac=gradient,
         constraints=cons,
         bounds=bounds,
         options={'disp': True, 'maxiter': 1000, 'ftol': 1e-4}
     )
 
-    # Get the approximated minimum eigenvalue of the continuous solution
-    f_opt, _ = min_eig_obj_lse_with_jac(res.x, inf_mats, H0, num_poses)
+    # Get the approximated minimum eigenvalue
+    f_opt = min_eig_obj_lse(res.x, inf_mats, H0, num_poses)
     approx_min_eig_val = -f_opt
 
     return res.x, approx_min_eig_val
+
+'''
+################################################################
+GUROBI Implementation
+'''
+
+# Define the callback for Branch and Cut
+def branch_and_cut_callback(model, where):
+    if where == GRB.Callback.MIPSOL:
+        # Retrieve the solution values as a list
+        sol = model.cbGetSolution([v for v in model._x.values()])
+        
+        # Identify selected indices
+        selected_indices = [i for i, val in enumerate(sol) if val > 0.5]
+        if not selected_indices:
+            return
+
+        # Combine the FIMs based on selected indices
+        combined_fim = model._H0.copy()
+        for idx in selected_indices:
+            combined_fim += model._inf_mats[idx]
+
+        # Compute Schur complement and minimum eigenvalue
+        try:
+            pose_dim = 6
+            num_pose_elements = model._num_poses * pose_dim
+            measurement_dim = combined_fim.shape[0] - num_pose_elements
+
+            Hll = combined_fim[:measurement_dim, :measurement_dim].tocsc()
+            Hlx = combined_fim[:measurement_dim, measurement_dim:].tocsc()
+            Hxx = combined_fim[measurement_dim:, measurement_dim:].tocsc()
+
+            X = spsolve(Hll, Hlx)
+            H_schur = Hxx - Hlx.T @ X
+
+            # Ensure H_schur is symmetric
+            H_schur = (H_schur + H_schur.T) / 2
+
+            # Compute the minimum eigenvalue
+            min_eig_val, _ = eigsh(H_schur, k=1, which='SA')
+        except Exception as e:
+            return
+
+        # Add the lazy constraint
+        model.cbLazy(model._min_eig_var <= min_eig_val[0])
+
+def gurobi_branch_and_cut(inf_mats, H0, num_sensors, k, num_poses, A, b, upper_bound=1e6):
+    """
+    Solves the sensor selection problem using Gurobi's MIP solver with Branch and Cut.
+
+    Args:
+        inf_mats (List[scipy.sparse.csr_matrix]): List of sparse information matrices.
+        H0 (scipy.sparse.csr_matrix): Prior information matrix.
+        num_sensors (int): Number of candidate sensors.
+        k (int): Number of sensors to select.
+        num_poses (int): Number of poses.
+        A (scipy.sparse.csr_matrix): Inequality constraint matrix.
+        b (np.ndarray): Inequality constraint bounds.
+        upper_bound (float): Upper bound for min_eig_var to prevent unboundedness.
+
+    Returns:
+        Tuple[List[int], float]: Selected sensors and the best score (maximum minimum eigenvalue).
+    """
+    # Ensure H0 is in CSC format for efficient arithmetic operations
+    H0 = H0.tocsc()
+    
+    # Ensure all inf_mats are in CSC format
+    inf_mats = [Hi.tocsc() for Hi in inf_mats]
+
+    # Optionally, precompute an upper bound for min_eig_var
+    try:
+        combined_fim_max = H0.copy()
+        for Hi in inf_mats:
+            combined_fim_max += Hi
+        max_eig_val, _ = eigsh(combined_fim_max, k=1, which='LA')
+        upper_bound = max_eig_val[0] * 2  # Set upper bound slightly above the maximum eigenvalue
+    except Exception as e:
+        return
+        
+    # Initialize Gurobi model
+    model = Model("SensorSelection")
+    model.Params.LazyConstraints = 1
+
+    # Add decision variables for sensor selection
+    x = model.addVars(num_sensors, vtype=GRB.BINARY, name="x")
+
+    # Add a continuous variable for minimum eigenvalue with an upper bound
+    min_eig_var = model.addVar(vtype=GRB.CONTINUOUS, name="min_eig_var", ub=upper_bound)
+
+    # Set the objective to maximize the minimum eigenvalue
+    model.setObjective(min_eig_var, GRB.MAXIMIZE)
+    
+    # Add constraint to select exactly k sensors
+    model.addConstr(x.sum() == k+1, name="sensor_selection")
+    
+
+    # Attach additional data to the model
+    model._x = x
+    model._min_eig_var = min_eig_var
+    model._inf_mats = inf_mats
+    model._H0 = H0
+    model._num_poses = num_poses
+
+    # Set the callback
+    model.optimize(branch_and_cut_callback)
+
+    # Check if an optimal solution was found
+    if model.status == GRB.OPTIMAL or model.status == GRB.SUBOPTIMAL:
+        # Extract the solution
+        selected_sensors = [j for j in range(num_sensors) if x[j].X > 0.5]
+        best_score = min_eig_var.X
+        return selected_sensors, best_score
+    else:
+        print(f"Optimization was not successful. Status code: {model.status}")
+        return None, None

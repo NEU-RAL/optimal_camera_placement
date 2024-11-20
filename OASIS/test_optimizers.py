@@ -12,7 +12,8 @@ from optimizations import (
     scipy_minimize_lse,
     roundsolution,
     roundsolution_breakties,
-    roundsolution_madow
+    roundsolution_madow,
+    gurobi_branch_and_cut
 )
 import FIM as fim
 import pandas as pd
@@ -61,13 +62,51 @@ def generate_random_fim(num_matrices, matrix_size, density=0.1, min_eigenvalue=2
 
         inf_mats.append(A)
 
-        # Optional: Verify the minimum eigenvalue (for debugging purposes)
-        # For large matrices, computing eigenvalues can be expensive
-        # Uncomment the following lines if you want to verify for small matrices
-        # if matrix_size <= 100:
-        #     eigvals = np.linalg.eigvalsh(A.toarray())
-        #     min_eig_val = np.min(eigvals)
-        #     print(f"Matrix {i + 1}: Minimum eigenvalue = {min_eig_val:.4f}")
+    return inf_mats
+
+def generate_fim_with_identity(num_matrices, matrix_size, k, density=0.1, min_eigenvalue=2.0, random_state=40):
+    """
+    Generates a list of random sparse symmetric positive-definite matrices with most being identity matrices.
+
+    Out of `num_matrices`, `num_matrices - k` matrices will be identity matrices scaled by `min_eigenvalue`,
+    and `k` matrices will be random symmetric positive-definite matrices.
+
+    Args:
+        num_matrices (int): Number of matrices to generate.
+        matrix_size (int): Size of the square matrices (number of rows/columns).
+        k (int): Number of random symmetric positive-definite matrices to generate.
+        density (float, optional): Density of the random sparse matrix B (fraction of non-zero elements). Default is 0.1.
+        min_eigenvalue (float, optional): Minimum eigenvalue for positive-definiteness. Default is 2.0.
+        random_state (int, optional): Seed for reproducibility. Default is 40.
+
+    Returns:
+        List[scipy.sparse.csr_matrix]: List of sparse symmetric positive-definite matrices in CSR format.
+    """
+    np.random.seed(random_state)
+    inf_mats = []
+
+    # Generate `num_matrices - k` identity matrices
+    identity_matrix = diags([min_eigenvalue] * matrix_size, format='csr')
+    for _ in range(num_matrices - k):
+        inf_mats.append(identity_matrix)
+
+    # Generate `k` random symmetric positive-definite matrices
+    for _ in range(k):
+        # Generate a random sparse matrix B with standard normal distributed non-zero entries
+        B = sparse_random(matrix_size, matrix_size, density=density, format='csr', 
+                         data_rvs=np.random.randn)
+
+        # Compute A = B^T B to ensure positive semi-definiteness
+        A = B.transpose().dot(B)
+
+        # Add c*I to make it positive definite
+        # Here, c is set to min_eigenvalue to ensure all eigenvalues >= min_eigenvalue
+        A += diags([min_eigenvalue] * matrix_size, format='csr')
+
+        inf_mats.append(A)
+
+    # Shuffle the matrices to ensure the random ones are not clustered at the end
+    np.random.shuffle(inf_mats)
 
     return inf_mats
 
@@ -82,241 +121,300 @@ def time_function(func, *args, **kwargs):
 
 # Main testing function
 def run_tests():
-    # Define pose and measurement dimensions
+    # Define pose dimension and base measurement dimension
     pose_dim = 6  # Each pose has 6 variables
-    measurement_dim = 10  # Total measurement dimension
 
-    num_poses_list = [10, 50, 100]
-
-    # Define the list of num_matrices to test
-    density = 0.05        # 5% non-zero elements
+    # Define test parameters
+    density = 0.1        # 10% non-zero elements
     min_eigenvalue = 5.0  # Minimum eigenvalue
 
-    num_matrices_list = [10]
-    # k_values
+    # Test configurations
+    # Uncomment and adjust as needed for larger tests
+    # k_values = [5, 10, 50, 100, 500]
+    # num_matrices_list = [10, 50, 100, 500, 1000]
+    # num_poses_list = [15, 81, 165]  # Chosen to achieve matrix size of 100, 500, 1000
+
     k_values = [5]
+    num_matrices_list = [10]
+    num_poses_list = [10, 15]  # Chosen to achieve matrix size of 100, 500, 1000
 
-    # Initialize a list to store the results
-    results = []
+    # Initialize a results array
+    # Dimensions: (num_poses, num_matrices, k_values, optimizers, metrics)
+    # Metrics indices: 0 - best_score, 1 - k_max_score, 2 - break_ties_score, 3 - madow_score, 4 - exec_time, 5 - sub_opt_gap
+    results_n_k = np.zeros(
+        (len(num_poses_list), len(num_matrices_list), len(k_values), 4, 6)
+    )
 
-    results_n_k = np.zeros((len(num_poses_list), len(num_matrices_list), len(k_values), 4, 6))
+    # Mapping of optimizer names to their corresponding indices in the results_n_k array
+    optimizer_indices = {
+        "Greedy Selection": 0,
+        "Scipy Minimize": 1,
+        "Scipy Minimize LSE": 2,
+        "Frank-Wolfe": 3,
+        # "Gurobi Branch and Cut": 4
+    }
 
-    # Iterate over the values of num_matrices
+    # Initialize a list to store all test case results
+    all_test_case_results = []
+
+    # Define directories for saving results
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    results_dir = os.path.join("results", timestamp)
+    os.makedirs(results_dir, exist_ok=True)
+
+    # Directory for intermediate results
+    intermediate_dir = os.path.join(results_dir, "intermediate_results")
+    os.makedirs(intermediate_dir, exist_ok=True)
+
+    # Directory for selection vectors
+    selection_vectors_dir = os.path.join(results_dir, "selection_vectors")
+    os.makedirs(selection_vectors_dir, exist_ok=True)
+
+    # Define batch size for periodic saving
+    save_interval = 100  # Save every 100 test cases
+    test_case_counter = 0  # Counter for test cases
+
+    # Iterate over configurations
     for p_index, num_poses in enumerate(num_poses_list):
-        #iterate over different matrix sizes
-        for n_index,num_matrices in enumerate(num_matrices_list):
-            # Calculate matrix size
-            matrix_size = measurement_dim + num_poses * pose_dim
-            # Generate synthetic data
-            inf_mats = generate_random_fim(num_matrices, matrix_size, density, min_eigenvalue)
-            H0 = diags([min_eigenvalue] * matrix_size, format='csr')
-            selection_init = np.ones(num_matrices, dtype=np.float16) / num_matrices
-
-            # Iterate over k_values
+        for n_index, num_matrices in enumerate(num_matrices_list):
             for k_index, k in enumerate(k_values):
+                # Calculate matrix size
+                measurement_dim = 10  
+                matrix_size = measurement_dim + num_poses * pose_dim
+
+                # Check feasibility of the configuration
+                if k > num_matrices:
+                    print(f"Skipping test for k={k}, num_matrices={num_matrices} (k > num_matrices)")
+                    continue
+
                 # Constraint setup for optimization methods
-                A = csr_matrix(np.ones((1, num_matrices)))  # Create A as a sparse matrix
-                b = np.array([k])
+                A_constraint = csr_matrix(np.ones((1, num_matrices)))  # Create A as a sparse matrix
+                b_constraint = np.array([k])
 
-                print(f"\nRunning tests for matrix_size = {matrix_size},  num_matrices = {num_matrices}, k = {k}")
+                # Generate synthetic data
+                inf_mats = generate_fim_with_identity(
+                    num_matrices=num_matrices,
+                    matrix_size=matrix_size,
+                    k=k,
+                    density=density,
+                    min_eigenvalue=min_eigenvalue
+                )
+                H0 = diags([min_eigenvalue] * matrix_size, format='csr')
+                selection_init = np.ones(num_matrices, dtype=np.float16) / num_matrices
 
-                # Dictionary to store results for this test case
+                # Initialize a dictionary to store results for the current test case
                 test_case_result = {
-                    'num_matrices': num_matrices,
-                    'k': k,
+                    'configuration': {
+                        'num_poses': num_poses,
+                        'num_matrices': num_matrices,
+                        'k': k,
+                        'matrix_size': matrix_size,
+                        'density': density,
+                        'min_eigenvalue': min_eigenvalue
+                    },
                     'results': {}
                 }
-                # Run Greedy Selection
-                print("\nRunning Greedy Selection")
-                (selection_vec, best_score, avail_cand), exec_time = time_function(
-                    greedy_selection,
-                    inf_mats=np.array(inf_mats),
-                    prior=H0,
-                    Nc=k,
-                    metric=Metric.MIN_EIG,
-                    num_runs=1,
-                    num_poses=num_poses
-                )
 
-                print("Greedy Selection Results (selection vector):", np.nonzero(selection_vec))
-                selection_vector = selection_vec.tolist()
-                print("Greedy Selection Best Score:", best_score)
+                # Test each optimizer
+                for optimizer_name, optimizer_func, requires_constraints, needs_rounding in [
+                    ("Greedy Selection", greedy_selection, False, False),
+                    ("Scipy Minimize", scipy_minimize, True, True),
+                    ("Scipy Minimize LSE", scipy_minimize_lse, True, True),
+                    ("Frank-Wolfe", frank_wolfe_optimization, True, True),
+                    # ("Gurobi Branch and Cut", gurobi_branch_and_cut, True, True)  # Uncomment if Gurobi is used
+                ]:
+                    try:
+                        print(f"\nRunning {optimizer_name} for Matrix Size: {matrix_size}, k: {k}, Decision Variables: {num_matrices}")
+                        
+                        # Pass only required arguments based on whether constraints are needed
+                        if requires_constraints:
+                            result, exec_time = time_function(
+                                optimizer_func,
+                                inf_mats=inf_mats,
+                                H0=H0,
+                                selection_init=selection_init,
+                                num_poses=num_poses,
+                                A=A_constraint,
+                                b=b_constraint
+                            )
+                        else:
+                            result, exec_time = time_function(
+                                optimizer_func,
+                                inf_mats=inf_mats,
+                                prior=H0,
+                                Nc=k,
+                                metric=Metric.MIN_EIG,
+                                num_runs=1,
+                                num_poses=num_poses
+                            )
 
-                # Store results
-                test_case_result['results']['Greedy Selection'] = {
-                    'execution_time': exec_time,
-                    'best_score': best_score,
-                    'selection_vector': selection_vector
-                }
-                results_n_k[p_index, n_index, k_index, 0, 0]= best_score
-                results_n_k[p_index, n_index, k_index, 0, 1]= best_score
-                results_n_k[p_index, n_index, k_index, 0, 2] = best_score
-                results_n_k[p_index, n_index, k_index, 0, 3] = best_score
-                results_n_k[p_index, n_index, k_index, 0, 4]= exec_time
-                # results_n_k[n_index, k_index, 0, 5]= 0
+                        # Initialize variables to store scores
+                        k_max_score = None
+                        break_ties_score = None
+                        madow_score = None
 
-                print("\n" + "#" * 70)
+                        # Process results
+                        if optimizer_name == "Greedy Selection":
+                            selection_vec, best_score, _ = result
 
-                # Run Scipy Minimize Optimization
-                print("\nRunning Scipy Minimize Optimization")
-                (continuous_sol_scipy, min_eig_val_scipy), exec_time = time_function(
-                    scipy_minimize,
-                    inf_mats=inf_mats,
-                    H0=H0,
-                    selection_init=selection_init,
-                    k=k,
-                    num_poses=num_poses,
-                    A=A,
-                    b=b
-                )
+                            # Print results
+                            print(f"{optimizer_name} Results (selection vector indices):", np.nonzero(selection_vec)[0])
+                            print(f"{optimizer_name} Best Score:", best_score)
 
-                print("Scipy Minimize Results (selection vector):", continuous_sol_scipy)
-                print("Scipy Minimize Best Score unrounded:", min_eig_val_scipy)
-                k_max_sol = roundsolution(continuous_sol_scipy, k)
-                print("\nScipy Minimize Results (K - max):",np.nonzero(k_max_sol) )
-                k_max_score = fim.find_min_eig_pair(inf_mats, np.array(k_max_sol), H0, num_poses)[0]
-                print("Scipy Minimize (K - max) score:",k_max_score )
-                break_ties_sol = roundsolution_breakties(continuous_sol_scipy, k, inf_mats, H0)
-                print("\nScipy Minimize Results (Breakties):", np.nonzero(break_ties_sol))
-                break_ties_score = fim.find_min_eig_pair(inf_mats, np.array(break_ties_sol), H0, num_poses)[0]
-                print("Scipy Minimize Breakties score:", break_ties_score)
-                madow_sol = roundsolution_madow(continuous_sol_scipy, k)
-                print("\nScipy Minimize Results (Madow):",np.nonzero(madow_sol ))
-                madow_score = fim.find_min_eig_pair(inf_mats, np.array(madow_sol), H0, num_poses)[0]
-                print("Scipy Minimize madow score:",madow_score)
-                selection_vector = continuous_sol_scipy.tolist()
+                            # Save selection vector to a separate file
+                            selection_filename = f"p{p_index}_n{n_index}_k{k_index}_{optimizer_name.replace(' ', '_')}.npy"
+                            selection_path = os.path.join(selection_vectors_dir, selection_filename)
+                            np.save(selection_path, selection_vec)
 
-                # Store results
-                test_case_result['results']['Scipy Minimize'] = {
-                    'execution_time': exec_time,
-                    'best_score': min_eig_val_scipy,
-                    'selection_vector': selection_vector
-                }
-                results_n_k[p_index, n_index, k_index, 1, 0] = min_eig_val_scipy
-                results_n_k[p_index, n_index, k_index, 1, 1] = k_max_score
-                results_n_k[p_index, n_index, k_index, 1, 2] = break_ties_score
-                results_n_k[p_index, n_index, k_index, 1, 3] = madow_score
-                results_n_k[p_index, n_index, k_index, 1, 4]= exec_time
-                # results_n_k[n_index, k_index, 1, 5] = 0
+                            # Store in test_case_result
+                            test_case_result['results'][optimizer_name] = {
+                                'execution_time': exec_time,
+                                'best_score': float(best_score),  # Convert to Python float
+                                'selection_vector_path': selection_path
+                            }
 
-                print("\n" + "#" * 70)
-                # # Run Scipy Optimization with Smoothing (LSE)
-                # print("\nRunning Scipy Optimization with Smoothing (LSE)")
-                # (selection_scipy_lse, approx_min_eig_val_scipy_lse), exec_time = time_function(
-                #     scipy_minimize_lse,
-                #     inf_mats=inf_mats,
-                #     H0=H0,
-                #     selection_init=selection_init,
-                #     num_poses=num_poses,
-                #     A=A,
-                #     b=b
-                # )
-                #
-                # print("Scipy Optimization with Smoothing Results (selection vector):", selection_scipy_lse)
-                # print("Scipy Optimization with Smoothing Best Score:", approx_min_eig_val_scipy_lse)
-                # k_max_sol_lse = roundsolution(selection_scipy_lse, k)
-                # print("\nScipy Minimize LSE Results (K - max):", np.nonzero(k_max_sol_lse))
-                # k_max_score_lse = fim.find_min_eig_pair(inf_mats, np.array(k_max_sol_lse), H0, num_poses)[0]
-                # print("Scipy Minimize LSE (K - max) score:", k_max_score_lse)
-                # breakties_sol_lse = roundsolution_breakties(selection_scipy_lse, k, inf_mats, H0)
-                # print("\nScipy Minimize LSE Results (Breakties):", np.nonzero(breakties_sol_lse))
-                # break_ties_score_lse = fim.find_min_eig_pair(inf_mats, np.array(breakties_sol_lse), H0, num_poses)[0]
-                # print("Scipy Minimize LSE Breakties score:", break_ties_score_lse)
-                # madow_sol_lse = roundsolution_madow(selection_scipy_lse, k)
-                # print("\nScipy Minimize LSE Results (Madow):", np.nonzero((madow_sol_lse)))
-                # madow_score_lse = fim.find_min_eig_pair(inf_mats, np.array(madow_sol_lse), H0, num_poses)[0]
-                # print("Scipy Minimize LSE Madow score:", madow_score_lse)
-                # selection_vector = selection_scipy_lse.tolist()
-                #
-                #
-                # # Store results
-                # test_case_result['results']['Scipy Optimization with LSE'] = {
-                #     'execution_time': exec_time,
-                #     'best_score': approx_min_eig_val_scipy_lse,
-                #     'selection_vector': selection_vector
-                # }
-                # results_n_k[p_index, n_index, k_index, 2, 0] = approx_min_eig_val_scipy_lse
-                # results_n_k[p_index, n_index, k_index, 2, 1] = k_max_score_lse
-                # results_n_k[p_index, n_index, k_index, 2, 2] = break_ties_score_lse
-                # results_n_k[p_index, n_index, k_index, 2, 3] = madow_score_lse
-                # results_n_k[p_index, n_index, k_index, 2, 4] = exec_time
-                # # results_n_k[n_index, k_index, 2, 5] = 0
+                            # Store in results_n_k
+                            optimizer_idx = optimizer_indices[optimizer_name]
+                            results_n_k[p_index, n_index, k_index, optimizer_idx, 0] = float(best_score)
+                            # Since Greedy Selection does not perform rounding, other scores remain NaN
+                            results_n_k[p_index, n_index, k_index, optimizer_idx, 1] = np.nan
+                            results_n_k[p_index, n_index, k_index, optimizer_idx, 2] = np.nan
+                            results_n_k[p_index, n_index, k_index, optimizer_idx, 3] = np.nan
+                            results_n_k[p_index, n_index, k_index, optimizer_idx, 4] = exec_time
+                            results_n_k[p_index, n_index, k_index, optimizer_idx, 5] = np.nan  # sub_opt_gap if applicable
 
-                print("\n" + "#" * 70)
+                        else:
+                            selection_vec = result[0]
+                            best_score = result[1]
 
-                # Run Frank-Wolfe Optimization only for num_matrices = 10 and 100
-                # if num_matrices in [10, 100, 300]:
-                #     n_iters = 10000 if num_matrices == 10 else 1000
-                #     print("\nRunning Frank-Wolfe Optimization")
-                #     (final_solution, min_eig_val_unrounded, i), exec_time = time_function(
-                #         frank_wolfe_optimization,
-                #         inf_mats=inf_mats,
-                #         prior=H0,
-                #         n_iters=n_iters,
-                #         selection_init=selection_init,
-                #         k=k,
-                #         num_poses=num_poses,
-                #         A=A,
-                #         b=b
-                #     )
-                #
-                #     print("Frank-Wolfe Optimization Results (selection vector):", final_solution)
-                #     print("Frank-Wolfe Optimization Best Score:", min_eig_val_unrounded)
-                #     k_max_sol_fw = roundsolution(final_solution, k)
-                #     print("Frank-Wolfe Optimization Results (K - max):", np.nonzero(k_max_sol_fw))
-                #     k_max_score_fw = fim.find_min_eig_pair(inf_mats, np.array(k_max_sol_fw), H0, num_poses)[0]
-                #     print("Frank-Wolfe  (K - max) score:", k_max_score_fw)
-                #     breakties_sol_fw = roundsolution_breakties(final_solution, k, inf_mats, H0)
-                #     print("Frank-Wolfe Optimization Results (Breakties):", np.nonzero(breakties_sol_fw))
-                #     break_ties_score_fw = fim.find_min_eig_pair(inf_mats, np.array(breakties_sol_fw), H0, num_poses)[0]
-                #     print("Frank-WolfeBreakties score:", break_ties_score_fw)
-                #     madow_sol_fw = roundsolution_madow(final_solution, k)
-                #     print("Frank-Wolfe Optimization Results (Madow):", np.nonzero(madow_sol_fw))
-                #     madow_score_fw = fim.find_min_eig_pair(inf_mats, np.array(madow_sol_fw), H0, num_poses)[0]
-                #     print("Frank-Wolfe Madow score:", madow_score_fw)
-                #     selection_vector = final_solution.tolist()
-                #
-                #
-                #     # Store results
-                #     test_case_result['results']['Frank-Wolfe Optimization'] = {
-                #         'execution_time': exec_time,
-                #         'best_score': min_eig_val_unrounded,
-                #         'selection_vector': selection_vector
-                #     }
-                #     results_n_k[p_index, n_index, k_index, 3, 0] = min_eig_val_unrounded
-                #     results_n_k[p_index, n_index, k_index, 3, 1] = k_max_score_fw
-                #     results_n_k[p_index, n_index, k_index, 3, 2] = break_ties_score_fw
-                #     results_n_k[p_index, n_index, k_index, 3, 3] = madow_score_fw
-                #     results_n_k[p_index, n_index, k_index, 3, 4] = exec_time
-                #     # results_n_k[n_index, k_index, 2, 5] = 0
-                #
-                #     print("\n" + "#" * 70)
-                # else:
-                #     # print("Frank-Wolfe Optimization skipped for num_matrices =", num_matrices)
-                #     # Indicate that Frank-Wolfe was skipped
-                #     test_case_result['results']['Frank-Wolfe Optimization'] = {
-                #         'skipped': True
-                #     }
-                #
-                # # Append the test case result to the results list
-                # results.append(test_case_result)
-        #save the numpy array for specific number of poses (matrix size)
-    results_dir=os.path.join("results",datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-    os.mkdir(results_dir)
-    # save results in an array
-    np.save(os.path.join(results_dir,"results_p{}_n{}_k{}.pkl".format(len(num_poses_list), len(num_matrices_list), len(k_values))), results_n_k)
-    #save the experiment configuration
-    exp_config={
+                            # Print results in the requested format
+                            print(f"{optimizer_name} Results (selection vector):", selection_vec)
+                            print(f"{optimizer_name} Best Score unrounded:", best_score)
+
+                            # Perform rounding only for optimizers that need it
+                            if needs_rounding:
+                                k_max_sol = roundsolution(selection_vec, k)
+                                print(f"\n{optimizer_name} Results (K - max):", np.nonzero(k_max_sol)[0])
+                                k_max_score = float(fim.find_min_eig_pair(inf_mats, np.array(k_max_sol), H0, num_poses)[0])
+                                print(f"{optimizer_name} (K - max) score:", k_max_score)
+
+                                break_ties_sol = roundsolution_breakties(selection_vec, k, inf_mats, H0)
+                                print(f"\n{optimizer_name} Results (Breakties):", np.nonzero(break_ties_sol)[0])
+                                break_ties_score = float(fim.find_min_eig_pair(inf_mats, np.array(break_ties_sol), H0, num_poses)[0])
+                                print(f"{optimizer_name} Breakties score:", break_ties_score)
+
+                                madow_sol = roundsolution_madow(selection_vec, k)
+                                print(f"\n{optimizer_name} Results (Madow):", np.nonzero(madow_sol)[0])
+                                madow_score = float(fim.find_min_eig_pair(inf_mats, np.array(madow_sol), H0, num_poses)[0])
+                                print(f"{optimizer_name} Madow score:", madow_score)
+
+                                # Save selection vectors to separate files
+                                selection_filename_base = f"p{p_index}_n{n_index}_k{k_index}_{optimizer_name.replace(' ', '_')}"
+                                
+                                k_max_filename = f"{selection_filename_base}_k_max.npy"
+                                k_max_path = os.path.join(selection_vectors_dir, k_max_filename)
+                                np.save(k_max_path, k_max_sol)
+
+                                break_ties_filename = f"{selection_filename_base}_break_ties.npy"
+                                break_ties_path = os.path.join(selection_vectors_dir, break_ties_filename)
+                                np.save(break_ties_path, break_ties_sol)
+
+                                madow_filename = f"{selection_filename_base}_madow.npy"
+                                madow_path = os.path.join(selection_vectors_dir, madow_filename)
+                                np.save(madow_path, madow_sol)
+
+                                # Save the original selection vector as well
+                                original_selection_filename = f"{selection_filename_base}.npy"
+                                original_selection_path = os.path.join(selection_vectors_dir, original_selection_filename)
+                                np.save(original_selection_path, selection_vec)
+
+                                # Store in test_case_result
+                                test_case_result['results'][optimizer_name] = {
+                                    'execution_time': exec_time,
+                                    'best_score': float(best_score),  # Convert to Python float
+                                    'selection_vector_path': original_selection_path,
+                                    'k_max_score': k_max_score,
+                                    'break_ties_score': break_ties_score,
+                                    'madow_score': madow_score,
+                                    'k_max_solution_path': k_max_path,
+                                    'break_ties_solution_path': break_ties_path,
+                                    'madow_solution_path': madow_path
+                                }
+
+                                # Store in results_n_k
+                                optimizer_idx = optimizer_indices[optimizer_name]
+                                results_n_k[p_index, n_index, k_index, optimizer_idx, 0] = float(best_score)
+                                results_n_k[p_index, n_index, k_index, optimizer_idx, 1] = k_max_score
+                                results_n_k[p_index, n_index, k_index, optimizer_idx, 2] = break_ties_score
+                                results_n_k[p_index, n_index, k_index, optimizer_idx, 3] = madow_score
+                                results_n_k[p_index, n_index, k_index, optimizer_idx, 4] = exec_time
+                                results_n_k[p_index, n_index, k_index, optimizer_idx, 5] = np.nan  # sub_opt_gap
+
+                    except Exception as e:
+                        print(f"{optimizer_name} failed: {e}")
+                        # Optionally, store the exception information
+                        test_case_result['results'][optimizer_name] = {
+                            'error': str(e)
+                        }
+                        # Assign np.nan to relevant entries in results_n_k
+                        optimizer_idx = optimizer_indices.get(optimizer_name)
+                        if optimizer_idx is not None:
+                            results_n_k[p_index, n_index, k_index, optimizer_idx, :] = np.nan
+
+                # Append the current test case results to the list
+                all_test_case_results.append(test_case_result)
+                test_case_counter += 1
+
+                # Check if it's time to save intermediate results
+                if test_case_counter % save_interval == 0:
+                    print(f"\nSaving intermediate results after {test_case_counter} test cases...")
+                    # Define filenames with batch number
+                    batch_number = test_case_counter // save_interval
+                    intermediate_results_path = os.path.join(intermediate_dir, f"results_batch_{batch_number}.yaml")
+                    intermediate_results_n_k_path = os.path.join(intermediate_dir, f"results_n_k_batch_{batch_number}.npy")
+                    
+                    # Save the accumulated test case results
+                    with open(intermediate_results_path, "w") as f:
+                        yaml.dump(all_test_case_results, f)
+                    
+                    # Save the current state of results_n_k
+                    np.save(intermediate_results_n_k_path, results_n_k)
+                    
+                    # Reset the accumulated results
+                    all_test_case_results = []
+                    results_n_k.fill(0)  # Reset the NumPy array
+
+    # After all test cases are processed, save any remaining results
+    if all_test_case_results:
+        print(f"\nSaving final batch of {test_case_counter % save_interval} test cases...")
+        batch_number = (test_case_counter // save_interval) + 1
+        intermediate_results_path = os.path.join(intermediate_dir, f"results_batch_{batch_number}.yaml")
+        intermediate_results_n_k_path = os.path.join(intermediate_dir, f"results_n_k_batch_{batch_number}.npy")
+        
+        # Save the accumulated test case results
+        with open(intermediate_results_path, "w") as f:
+            yaml.dump(all_test_case_results, f)
+        
+        # Save the current state of results_n_k
+        np.save(intermediate_results_n_k_path, results_n_k)
+
+    # Save all test case results as a YAML file for easier readability
+    # Note: YAML might not handle NumPy arrays directly, so ensure selection vectors are saved separately
+    with open(os.path.join(results_dir, "all_test_case_results.yaml"), "w") as f:
+        yaml.dump(all_test_case_results, f)
+
+    # Save experiment configuration
+    exp_config = {
         "pose_dim": pose_dim,
-        "measurement_dim": measurement_dim,
         "num_poses_list": num_poses_list,
         "num_matrices_list": num_matrices_list,
         "k_values": k_values,
-        "algos": ["greedy","scipy","scipy-lse","frank-wolfe"],
-        "metrics": ["unr_score", "k-max", "break-ties", "madow", "exec_time", "sub-opt-gap"] #sub-opt-gap not implemented
+        "algos": ["greedy", "scipy", "scipy-lse", "frank-wolfe", "gurobi"], # Still working on gurobi
+        "metrics": ["best_score", "k_max_score", "break_ties_score", "madow_score", "exec_time", "sub_opt_gap"]
     }
     with open(os.path.join(results_dir, "exp_config.yaml"), "w") as f:
         yaml.dump(exp_config, f)
+
 
 if __name__ == "__main__":
     run_tests()
