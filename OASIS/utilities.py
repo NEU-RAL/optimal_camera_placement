@@ -4,15 +4,18 @@ import matplotlib.pyplot as plt
 import math
 
 from gtsam.utils import plot
+import scipy
 
 '''
 Utilities
 '''
 
 def check_symmetric(a, rtol=1e-03, atol=1e-03):
+    if scipy.sparse.issparse(a):
+        a = a.toarray()
     res = np.allclose(a, a.T, rtol=rtol, atol=atol)
     if not res:
-        print("Norm of distace between symmetry", np.linalg.norm(a - a.T))
+        print("Norm of distance between symmetry", np.linalg.norm(a - a.T))
     return res
 
 '''
