@@ -10,6 +10,7 @@ from optimizations import (
     frank_wolfe_optimization,
     scipy_minimize,
     scipy_minimize_lse,
+    scipy_minimize_lse_d,
     # roundsolution,               # Removed rounding functions
     # roundsolution_breakties,
     # roundsolution_madow,
@@ -19,6 +20,7 @@ import FIM as fim
 import pandas as pd
 import os
 import datetime
+import utilities
 
 # Define Metric Enum for selection
 class Metric(Enum):
@@ -37,14 +39,15 @@ def generate_random_fim(num_matrices, matrix_size, density=0.1, min_eigenvalue=5
         # Generate a random sparse matrix B with standard normal distributed non-zero entries
         B = sparse_random(matrix_size, matrix_size, density=density, format='csr', 
                           data_rvs=np.random.randn)
-
-        # Compute A = B^T B to ensure positive semi-definiteness
-        A = B.transpose().dot(B)
+        # Compute A = B^T + B to ensure positive semi-definiteness
+        #A = B.transpose().dot(B)
+        A = B.transpose() + B
 
         # Add c*I to make it positive definite
         c = min_eigenvalue
         A += diags([c] * matrix_size, format='csr')
-
+        assert utilities.check_symmetric(A)
+        #print(A.getnnz()/np.prod(A.shape))
         inf_mats.append(A)
 
     return inf_mats
@@ -67,12 +70,15 @@ def generate_fim_with_identity(num_matrices, matrix_size, k, density=0.1, min_ei
         B = sparse_random(matrix_size, matrix_size, density=density, format='csr', 
                           data_rvs=np.random.randn)
 
-        # Compute A = B^T B to ensure positive semi-definiteness
-        A = B.transpose().dot(B)
+        # Compute A = B^T + B to ensure positive semi-definiteness
+        # A = B.transpose().dot(B)
+        A = B.transpose() + B
 
         # Add c*I to make it positive definite
         c = min_eigenvalue
         A += diags([c] * matrix_size, format='csr')
+        assert utilities.check_symmetric(A)
+        # print(A.getnnz()/np.prod(A.shape))
 
         inf_mats.append(A)
 
@@ -115,7 +121,8 @@ def run_tests():
     optimizer_indices = {
         "Greedy Selection": 0,
         "Scipy Minimize LSE": 1,
-        "Frank-Wolfe": 2,
+        "Scipy Minimize LSE dense": 2,
+        "Frank-Wolfe": 3,
         # "Gurobi Branch and Cut": 3  # Uncomment if using Gurobi
     }
 
@@ -144,7 +151,7 @@ def run_tests():
         for n_index, num_matrices in enumerate(num_matrices_list):
             for k_index, k in enumerate(k_values):
                 # Calculate matrix size
-                measurement_dim = 10  
+                measurement_dim = 10
                 matrix_size = measurement_dim + num_poses * pose_dim
 
                 # Check feasibility of the configuration
@@ -183,6 +190,7 @@ def run_tests():
                 for optimizer_name, optimizer_func, requires_constraints, needs_rounding in [
                     ("Greedy Selection", greedy_selection, False, False),
                     ("Scipy Minimize LSE", scipy_minimize_lse, True, False),
+                    ("Scipy Minimize LSE dense", scipy_minimize_lse_d, True, False),
                     ("Frank-Wolfe", frank_wolfe_optimization, True, False),
                     # ("Gurobi Branch and Cut", gurobi_branch_and_cut, True, False)  # Uncomment if Gurobi is used
                 ]:

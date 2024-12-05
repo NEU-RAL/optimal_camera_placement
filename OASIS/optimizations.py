@@ -5,6 +5,9 @@ import gtsam
 import scipy
 from enum import Enum
 from enum import Enum
+
+from sympy.polys.benchmarks.bench_solvers import time_eqs_10x8
+
 import utilities
 import FIM as infmat
 import numpy as np
@@ -30,6 +33,72 @@ class Metric(Enum):
     LOGDET = 1
     MIN_EIG = 2
     MSE = 3
+#Test with dense matrices
+def compute_schur_complement_d(x, inf_mats, H0, num_poses):
+    """
+    Computes the Schur complement and auxiliary matrices for use in the objective and gradient computations.
+
+    Args:
+        x (np.ndarray): Continuous selection vector.
+        inf_mats (List[scipy.sparse.csr_matrix]): List of sparse information matrices.
+        H0 (scipy.sparse.csr_matrix): Prior information matrix.
+        num_poses (int): Number of poses.
+
+    Returns:
+        Tuple[scipy.sparse.csc_matrix, np.ndarray, scipy.sparse.csc_matrix, scipy.sparse.csc_matrix]:
+        - H_schur: The Schur complement matrix.
+        - min_eig_vec: Eigenvector corresponding to the smallest eigenvalue of H_schur.
+        - T1: Dense intermediate matrix Hxl * inv(Hll)
+        - T2: Dense intermediate matrix from solving Hll * T2 = Hlx.
+    """
+    # Combine the Fisher Information Matrices
+    # s= time.time()
+    #print("in schur complement")
+    combined_fim = H0.copy()
+    for xi, Hi in zip(x, inf_mats):
+        combined_fim += xi * Hi
+
+    # Extract submatrices
+    pose_dim = 6
+    num_pose_elements = num_poses * pose_dim
+    measurement_dim = combined_fim.shape[0] - num_pose_elements
+    Hll = combined_fim[:measurement_dim, :measurement_dim]
+    Hlx = combined_fim[:measurement_dim, measurement_dim:]
+    Hxx = combined_fim[measurement_dim:, measurement_dim:]
+
+    # s1 = time.time()
+    try:
+        # # Convert Hll to dense if it is sparse
+        if scipy.sparse.issparse(Hll):
+            Hll = Hll.toarray()
+        # Regularize and compute the pseudoinverse of Hll
+        reg_term = 1e-8 * np.eye(Hll.shape[0])
+
+        Hll_inv = np.linalg.pinv(Hll + reg_term)
+    except Exception as e:
+        raise ValueError(f"Failed to compute pseudoinverse for candidate: {e}")
+
+    # Compute the Schur complement
+    H_schur = Hxx - Hlx.T @ Hll_inv @ Hlx
+
+    # Ensure H_schur is symmetric
+    H_schur = (H_schur + H_schur.T) / 2
+    T2 = Hll_inv @ Hlx
+    T1 = Hlx.transpose().dot(Hll_inv)
+
+    # e1 = time.time()
+    # execution_time = e1 - s1
+    # print(f"execution time dense schur: {execution_time:.4f} seconds")
+
+    # # Compute smallest eigenvalue and eigenvector
+    # try:
+    #     v , w = scipy.linalg.eigh(H_schur)
+    #     min_eig_vec = w[:,0:1]
+    # except Exception as e:
+    #     print("Eigenvalue solver failed:", e)
+    #     min_eig_vec = np.zeros(H_schur.shape[1])
+
+    return H_schur, T1, T2, measurement_dim
 
 def compute_schur_complement(x, inf_mats, H0, num_poses):
     """
@@ -45,8 +114,8 @@ def compute_schur_complement(x, inf_mats, H0, num_poses):
         Tuple[scipy.sparse.csc_matrix, np.ndarray, scipy.sparse.csc_matrix, scipy.sparse.csc_matrix]:
         - H_schur: The Schur complement matrix.
         - min_eig_vec: Eigenvector corresponding to the smallest eigenvalue of H_schur.
-        - Hll: Submatrix from combined FIM.
-        - X: Dense intermediate matrix from solving Hll * X = Hlx.
+        - T1: Dense intermediate matrix Hxl * inv(Hll)
+        - T2: Dense intermediate matrix from solving Hll * T2 = Hlx.
     """
     # Combine the Fisher Information Matrices
     combined_fim = H0.copy()
@@ -62,13 +131,20 @@ def compute_schur_complement(x, inf_mats, H0, num_poses):
     Hxx = combined_fim[measurement_dim:, measurement_dim:].tocsc()
 
     # Compute Schur complement
+    #s= time.time()
     try:
-        X = spsolve(Hll.tocsc(), Hlx.tocsc())
+        # T2 = spsolve(Hll.tocsc(), Hlx.tocsc())
+        Hll_inv = scipy.sparse.linalg.inv(Hll.tocsc())
+        T2 = Hll_inv.dot(Hlx)
+        T1 = Hlx.transpose().dot(Hll_inv)
     except Exception as e:
         print("Linear solver failed:", e)
-        X = Hll.inverse().dot(Hlx).toarray()
+        T2= Hll.inverse().dot(Hlx).toarray()
 
-    H_schur = Hxx - Hlx.transpose().dot(X)
+    H_schur = Hxx - Hlx.transpose().dot(T2)
+    # e= time.time()
+    # execution_time = e - s
+    # print(f"execution time sparse schur: {execution_time:.4f} seconds")
 
     # Compute smallest eigenvalue and eigenvector
     try:
@@ -77,7 +153,7 @@ def compute_schur_complement(x, inf_mats, H0, num_poses):
         print("Eigenvalue solver failed:", e)
         min_eig_vec = np.zeros(H_schur.shape[1])
 
-    return H_schur, min_eig_vec, Hll, X
+    return H_schur, min_eig_vec, T1, T2, measurement_dim
 
 def compute_combined_fim(x, inf_mats, H0):
     combined_fim = H0.copy()
@@ -289,14 +365,11 @@ def frank_wolfe_optimization(
 
         # Compute gradient
         try:
-            H_schur, min_eig_vec, Hll, X = compute_schur_complement(selection_cur, inf_mats, H0, num_poses)
-            # Precompute constants for gradient
-            t2 = X.transpose()
+            H_schur, min_eig_vec, T1, T2, measurement_dim = compute_schur_complement(selection_cur, inf_mats, H0, num_poses)
 
             # Parallelized gradient computation
-            measurement_dim = Hll.shape[0]
             results = Parallel(n_jobs=-1)(
-                delayed(compute_grad_parallel)(idx, Hi, Hll, X, t2, min_eig_vec, measurement_dim)
+                delayed(compute_grad_parallel)(idx, Hi, T1, T2, min_eig_vec, measurement_dim)
                 for idx, Hi in enumerate(inf_mats)
             )
 
@@ -482,7 +555,7 @@ def evaluate_solution(inf_mats, H0, solution, num_poses):
     return min_eig_val
 
 # Define a function to parallelize the computation for a single Hi
-def compute_grad_parallel(idx, Hi, Hll, X, t2, min_eig_vec, measurement_dim):
+def compute_grad_parallel(idx, Hi, T1, T2, min_eig_vec, measurement_dim):
     """
     Compute gradient contribution for a single Hi matrix.
 
@@ -490,8 +563,8 @@ def compute_grad_parallel(idx, Hi, Hll, X, t2, min_eig_vec, measurement_dim):
         idx (int): Index of the matrix.
         Hi (scipy.sparse.csr_matrix): Information matrix.
         Hll (scipy.sparse.csc_matrix): Submatrix from combined FIM.
-        X (np.ndarray): Dense intermediate matrix from Schur computation.
-        t2 (np.ndarray): Transpose of X.
+        T1 (np.ndarray): Dense intermediate matrix from Schur computation - Hxl * inv(Hll)
+        T2 (np.ndarray): intermediate matrix from Schur computation -  inv(Hll) * Hlx
         min_eig_vec (np.ndarray): Smallest eigenvector of Schur complement.
         measurement_dim (int): Dimensionality of the measurement space.
 
@@ -503,20 +576,19 @@ def compute_grad_parallel(idx, Hi, Hll, X, t2, min_eig_vec, measurement_dim):
     Hlx_i = Hi[:measurement_dim, measurement_dim:].tocsc()
     Hxx_i = Hi[measurement_dim:, measurement_dim:].tocsc()
 
-    # Compute grad_schur = Hxx_i - Hlx_i^T * X - t2 * Hll_i * Y + t2 * Hlx_i
-    try:
-        Y = spsolve(Hll, Hlx_i.tocsc())
-    except Exception as e:
-        print(f"Linear solver failed for Hi index {idx}:", e)
-        Y = inv(Hll).dot(Hlx_i)  # Sparse fallback
-        Y = Y.toarray()  # Convert to dense for consistency
+    # Compute grad_schur
+    # try:
+    #     Y = spsolve(Hll, Hlx_i.tocsc())
+    # except Exception as e:
+    #     print(f"Linear solver failed for Hi index {idx}:", e)
+    #     Y = inv(Hll).dot(Hlx_i)  # Sparse fallback
+    #     Y = Y.toarray()  # Convert to dense for consistency
 
-    grad_schur = Hxx_i - Hlx_i.transpose().dot(X) - t2.dot(Hll_i.dot(Y)) + t2.dot(Hlx_i)
+    grad_schur = Hxx_i - Hlx_i.transpose().dot(T2) + T1.dot(Hll_i.dot(T2)) - T1.dot(Hlx_i)
 
     # Flatten vectors to ensure proper alignment
     grad_value = -min_eig_vec.flatten().dot(grad_schur.dot(min_eig_vec).flatten())
     return idx, grad_value
-
 
 '''
 ################################################################
@@ -559,14 +631,11 @@ def min_eig_grad(x, inf_mats, H0, num_poses):
         np.ndarray: Gradient vector.
     """
     start_time = time.time()
-    H_schur, min_eig_vec, Hll, X = compute_schur_complement(x, inf_mats, H0, num_poses)
-    # Precompute constants for gradient
-    t2 = X.transpose()
+    H_schur, min_eig_vec, T1, T2, measurement_dim = compute_schur_complement(x, inf_mats, H0, num_poses)
 
     # Parallelized gradient computation
-    measurement_dim = Hll.shape[0]
     results = Parallel(n_jobs=-1)(
-        delayed(compute_grad_parallel)(idx, Hi, Hll, X, t2, min_eig_vec, measurement_dim)
+        delayed(compute_grad_parallel)(idx, Hi, T1, T2, min_eig_vec, measurement_dim)
         for idx, Hi in enumerate(inf_mats)
     )
 
@@ -624,27 +693,28 @@ def scipy_minimize(inf_mats, H0, selection_init, num_poses, A, b):
 
 '''
 ################################################################
-Scipy optimization methods with Log sum exponential
+Scipy optimization methods with Log sum exponential on dense
 '''
-
-def min_eig_obj_lse(x, inf_mats, H0, num_poses, beta=5.0):
+def min_eig_obj_lse_d(x, inf_mats, H0, num_poses, beta=5.0):
     """
     Computes the objective function value using the Log-Sum-Exp (LSE) approximation.
     """
     # Use the helper function to compute the Schur complement and auxiliary matrices
-    H_schur, _, _, _ = compute_schur_complement(x, inf_mats, H0, num_poses)
+    H_schur, T1, T2,measurement_dim = compute_schur_complement_d(x, inf_mats, H0, num_poses)
 
     # Compute all eigenvalues of H_schur
     try:
         if H_schur.shape[0] <= 500:  # Threshold to determine when to switch to dense
             # Convert sparse matrix to dense for full eigenvalue computation
-            eigvals, _ = np.linalg.eigh(H_schur.toarray())
+            if isinstance(H_schur, np.matrix):
+                H_schur = np.asarray(H_schur)
+            eigvals, eigvecs = np.linalg.eigh(H_schur)
         else:
             # For very large matrices, use eigsh for performance and check fallback
             eigvals, _ = eigsh(H_schur, k=H_schur.shape[0] - 1, which="SA")
     except Exception as e:
         print(f"Eigenvalue computation failed: {e}")
-        return np.inf 
+        return np.inf , np.zeros_like(x)
 
     # Stabilize Log-Sum-Exp computation
     eigvals_shifted = eigvals - eigvals.min()  # Shift to stabilize
@@ -655,17 +725,151 @@ def min_eig_obj_lse(x, inf_mats, H0, num_poses, beta=5.0):
     f = (-1 / beta) * np.log(weight_sum) + eigvals.min()
     return -f
 
+def min_eig_grad_lse_d(x, inf_mats, H0, num_poses, beta=5.0):
+    """
+    Computes the gradient of the objective function using the Log-Sum-Exp (LSE) approximation.
+    """
+    # Use the helper function to compute the Schur complement and auxiliary matrices
+    s=time.time()
+    H_schur, T1, T2, measurement_dim = compute_schur_complement_d(x, inf_mats, H0, num_poses)
+
+    # Compute eigenvalues and eigenvectors
+    try:
+        if isinstance(H_schur, np.matrix):
+            H_schur = np.asarray(H_schur)
+        eigvals, eigvecs = np.linalg.eigh(H_schur)
+
+    except Exception as e:
+        print(f"Eigenvalue computation failed: {e}")
+        return np.zeros_like(x)  # Return zero gradient if computation fails
+
+    eigvals_shifted = eigvals - eigvals.min()  # Stabilize
+    scaled_exp_eigvals = np.exp(-beta * eigvals_shifted)
+    weight_sum = np.sum(scaled_exp_eigvals) + 1e-12
+    softmax_weights = scaled_exp_eigvals / weight_sum
+
+    # Parallelized gradient computation
+    def compute_grad_lse_d(idx, H_j, eigvecs, softmax_weights, measurement_dim):
+
+        s1 = time.time()
+        Hll_j_d = H_j[:measurement_dim, :measurement_dim]
+        Hlx_j_d = H_j[:measurement_dim, measurement_dim:]
+        Hxx_j_d = H_j[measurement_dim:, measurement_dim:]
+        grad_schur_d = Hxx_j_d - Hlx_j_d.T @ T2 + T1 @ Hll_j_d @ T2 - T1 @ Hlx_j_d
+
+        lambda_derivatives_d = np.array([
+            eigvecs[:, i].T @ grad_schur_d @ eigvecs[:, i]
+            for i in range(len(eigvals))
+        ])
+
+        tmp_d = np.sum(softmax_weights * lambda_derivatives_d)
+        # e1 = time.time()
+        # execution_time = e1 - s1
+        # print(f"execution time grad schur computation dense : {execution_time:.4f} seconds")
+
+        return idx, tmp_d
+    s1 = time.time()
+    results = Parallel(n_jobs=-1)(
+        delayed(compute_grad_lse_d)(idx, H_j.toarray(), eigvecs, softmax_weights, measurement_dim)
+        for idx, H_j in enumerate(inf_mats)
+    )
+    # Collect results into the gradient vector
+    grad = np.zeros_like(x)
+    for idx, grad_value in results:
+        grad[idx] = grad_value
+    # e1 = time.time()
+    # execution_time = e1 - s1
+    # print(f"execution time grad schur computation : {execution_time:.4f} seconds")
+    return -grad
+
+def scipy_minimize_lse_d(inf_mats, H0, selection_init, num_poses, A, b):
+    """
+    Uses `scipy.optimize.minimize` with inequality constraints to solve a sensor selection problem
+    using the Log-Sum-Exp (LSE) approximation, separating the objective and gradient calculations.
+    """
+    # Set bounds for each variable in x (between 0 and 1)
+    bounds = [(0, 1) for _ in range(selection_init.shape[0])]
+
+    # Define constraints
+    cons = [{'type': 'ineq', 'fun': lambda x: b - A @ x}]
+
+    # Define objective and gradient as separate functions
+    def objective(x):
+        return min_eig_obj_lse_d(x, inf_mats, H0, num_poses)
+
+    def gradient(x):
+        return min_eig_grad_lse_d(x, inf_mats, H0, num_poses)
+
+    # Optimization function
+    res = minimize(
+        fun=objective,
+        x0=selection_init,
+        method='SLSQP',
+        jac=gradient,
+        constraints=cons,
+        bounds=bounds,
+        options={'disp': True, 'maxiter': 1000, 'ftol': 1e-4}
+    )
+
+    # Get the approximated minimum eigenvalue
+    f_opt = min_eig_obj_lse_d(res.x, inf_mats, H0, num_poses)
+    approx_min_eig_val = -f_opt
+
+    return res.x, approx_min_eig_val
+
+'''
+################################################################
+Scipy optimization methods with Log sum exponential
+'''
+
+def min_eig_obj_lse(x, inf_mats, H0, num_poses, beta=5.0):
+    """
+    Computes the objective function value using the Log-Sum-Exp (LSE) approximation.
+    """
+    # Use the helper function to compute the Schur complement and auxiliary matrices
+    H_schur, min_eig_vec, T1, T2,measurement_dim = compute_schur_complement(x, inf_mats, H0, num_poses)
+
+    # Compute all eigenvalues of H_schur
+    try:
+        if H_schur.shape[0] <= 500:  # Threshold to determine when to switch to dense
+            # Convert sparse matrix to dense for full eigenvalue computation
+            if scipy.sparse.issparse(H_schur):
+                H_schur = H_schur.toarray()
+            if isinstance(H_schur, np.matrix):
+                H_schur = np.asarray(H_schur)
+            eigvals, _ = np.linalg.eigh(H_schur)
+        else:
+            # For very large matrices, use eigsh for performance and check fallback
+            eigvals, _ = eigsh(H_schur, k=H_schur.shape[0] - 1, which="SA")
+    except Exception as e:
+        print(f"Eigenvalue computation failed: {e}")
+        return np.inf , np.zeros_like(x)
+
+    # Stabilize Log-Sum-Exp computation
+    eigvals_shifted = eigvals - eigvals.min()  # Shift to stabilize
+    scaled_exp_eigvals = np.exp(-beta * eigvals_shifted)
+    weight_sum = np.sum(scaled_exp_eigvals) + 1e-12
+
+    # Objective value using Log-Sum-Exp
+    f = (-1 / beta) * np.log(weight_sum) + eigvals.min()
+
+    return -f
+
 def min_eig_grad_lse(x, inf_mats, H0, num_poses, beta=5.0):
     """
     Computes the gradient of the objective function using the Log-Sum-Exp (LSE) approximation.
     """
     # Use the helper function to compute the Schur complement and auxiliary matrices
-    H_schur, min_eig_vec, Hll, X = compute_schur_complement(x, inf_mats, H0, num_poses)
+    H_schur, min_eig_vec, T1, T2, measurement_dim = compute_schur_complement(x, inf_mats, H0, num_poses)
 
     # Compute eigenvalues and eigenvectors
     try:
         if H_schur.shape[0] <= 500:
-            eigvals, eigvecs = np.linalg.eigh(H_schur.toarray())
+            if scipy.sparse.issparse(H_schur):
+                H_schur = H_schur.toarray()
+            if isinstance(H_schur, np.matrix):
+                H_schur = np.asarray(H_schur)
+            eigvals, eigvecs = np.linalg.eigh(H_schur)
         else:
             eigvals, eigvecs = eigsh(H_schur, k=H_schur.shape[0] - 1, which="SA")
     except Exception as e:
@@ -678,31 +882,27 @@ def min_eig_grad_lse(x, inf_mats, H0, num_poses, beta=5.0):
     softmax_weights = scaled_exp_eigvals / weight_sum
 
     # Parallelized gradient computation
-    def compute_grad_lse(idx, H_j, eigvecs, softmax_weights):
-        Hll_j = H_j[:Hll.shape[0], :Hll.shape[0]].tocsc()
-        Hlx_j = H_j[:Hll.shape[0], Hll.shape[0]:].tocsc()
-        Hxx_j = H_j[Hll.shape[0]:, Hll.shape[0]:].tocsc()
+    def compute_grad_lse(idx, H_j, eigvecs, softmax_weights, measurement_dim):
+        # Hll_j = H_j[:measurement_dim, :measurement_dim].tocsc()
+        # Hlx_j = H_j[:measurement_dim, measurement_dim:].tocsc()
+        # Hxx_j = H_j[measurement_dim:,measurement_dim:].tocsc()
 
-        try:
-            Hll_j_inv = spsolve(Hll, sp.identity(Hll.shape[0]).tocsc())
-        except Exception as e:
-            print(f"Linear solver failed for H_j index {idx}: {e}")
-            Hll_j_inv = Hll.inverse()
-
-        H_schur_j = Hxx_j - Hlx_j.T @ Hll_j_inv @ Hlx_j
-        H_schur_j = (H_schur_j + H_schur_j.T) / 2  # Ensure symmetry
-
-        lambda_derivatives = np.array([
-            eigvecs[:, i].T @ H_schur_j @ eigvecs[:, i]
+        H_j_d = H_j.toarray()
+        Hll_j_d = H_j_d[:measurement_dim, :measurement_dim]
+        Hlx_j_d = H_j_d[:measurement_dim, measurement_dim:]
+        Hxx_j_d = H_j_d[measurement_dim:, measurement_dim:]
+        grad_schur_d = Hxx_j_d - Hlx_j_d.T @ T2 + T1 @ Hll_j_d @ T2 - T1 @ Hlx_j_d
+        lambda_derivatives_d = np.array([
+            eigvecs[:, i].T @ grad_schur_d @ eigvecs[:, i]
             for i in range(len(eigvals))
         ])
-        return idx, np.sum(softmax_weights * lambda_derivatives)
+        tmp_d = np.sum(softmax_weights * lambda_derivatives_d)
+        return idx, tmp_d
 
     results = Parallel(n_jobs=-1)(
-        delayed(compute_grad_lse)(idx, H_j, eigvecs, softmax_weights)
+        delayed(compute_grad_lse)(idx, H_j, eigvecs, softmax_weights, measurement_dim)
         for idx, H_j in enumerate(inf_mats)
     )
-
     # Collect results into the gradient vector
     grad = np.zeros_like(x)
     for idx, grad_value in results:
