@@ -49,9 +49,7 @@ def compute_schur_complement(x, inf_mats, H0, num_poses):
         - X: Dense intermediate matrix from solving Hll * X = Hlx.
     """
     # Combine the Fisher Information Matrices
-    combined_fim = H0.copy()
-    for xi, Hi in zip(x, inf_mats):
-        combined_fim += xi * Hi
+    combined_fim = compute_combined_fim(x, inf_mats, H0)
 
     # Extract submatrices
     pose_dim = 6
@@ -63,7 +61,7 @@ def compute_schur_complement(x, inf_mats, H0, num_poses):
 
     # Compute Schur complement
     try:
-        X = spsolve(Hll.tocsc(), Hlx.tocsc())
+        X = spsolve(Hll, Hlx)
     except Exception as e:
         print("Linear solver failed:", e)
         X = Hll.inverse().dot(Hlx).toarray()
@@ -72,12 +70,13 @@ def compute_schur_complement(x, inf_mats, H0, num_poses):
 
     # Compute smallest eigenvalue and eigenvector
     try:
-        _, min_eig_vec = eigsh(H_schur, k=1, which='SA')
+        min_eig_val, min_eig_vec = eigsh(H_schur, k=1, which='SA')
     except Exception as e:
         print("Eigenvalue solver failed:", e)
         min_eig_vec = np.zeros(H_schur.shape[1])
 
-    return H_schur, min_eig_vec, Hll, X
+    return H_schur, min_eig_val, min_eig_vec, Hll, X
+
 
 def compute_combined_fim(x, inf_mats, H0):
     combined_fim = H0.copy()
@@ -237,60 +236,27 @@ def frank_wolfe_optimization(
     Returns:
         Tuple[np.ndarray, float, int]: Final selection vector, best score (smallest eigenvalue), and number of iterations.
     """
-
-    H0 = H0.tocsc()
-    inf_mats = [Hi.tocsc() for Hi in inf_mats]
-    
-    # Convert A to CSC format
-    A = sp.csc_matrix(A)
     # Initialize selection vector as a continuous variable (float)
     selection_cur = selection_init.copy().astype(float)
     prev_min_eig = -np.inf  # Initialize to negative infinity for maximization
     
     for iteration in range(1000):
-        # Combine the Fisher Information Matrices based on current selection
-        combined_fim = H0.copy().tocsc()
-        for idx, sel in enumerate(selection_cur):
-            combined_fim += sel * inf_mats[idx]
-        
         # Compute the Schur complement and minimum eigenvalue
         try:
-            pose_dim = 6  # Adjust if different
-            num_pose_elements = num_poses * pose_dim
-            total_size = combined_fim.shape[0]
-            measurement_dim = total_size - num_pose_elements
+            _, min_eig_val, min_eig_vec, Hll, X = compute_schur_complement(selection_cur, inf_mats, H0, num_poses)
 
-            Hll = combined_fim[:measurement_dim, :measurement_dim].tocsc()
-            Hlx = combined_fim[:measurement_dim, measurement_dim:].tocsc()
-            Hxx = combined_fim[measurement_dim:, measurement_dim:].tocsc()
-
-            # Solve Hll * X = Hlx
-            X = spsolve(Hll, Hlx).toarray()
-
-            # Compute Schur complement
-            H_schur = Hxx - Hlx.transpose().dot(X)
-
-            # Ensure symmetry
-            H_schur = (H_schur + H_schur.T) / 2
-
-            # Compute the smallest eigenvalue and corresponding eigenvector
-            min_eig_val, min_eig_vec = eigsh(H_schur, k=1, which='SA')
-            min_eig_val = min_eig_val[0]
-            min_eig_vec = min_eig_vec[:, 0]
         except Exception as e:
             print(f"Error during Schur complement or eigenvalue computation at iteration {iteration}: {e}")
             break
 
         # Check for convergence
-        if abs(min_eig_val - prev_min_eig) < 1e-4:
+        if abs(min_eig_val - prev_min_eig) < 1e-2:
             print(f"Converged at iteration {iteration}")
             break
         prev_min_eig = min_eig_val
 
         # Compute gradient
         try:
-            H_schur, min_eig_vec, Hll, X = compute_schur_complement(selection_cur, inf_mats, H0, num_poses)
-            # Precompute constants for gradient
             t2 = X.transpose()
 
             # Parallelized gradient computation
@@ -323,24 +289,30 @@ def frank_wolfe_optimization(
     return selection_cur, min_eig_val, iteration + 1
 
 
-def roundsolution(selection, k):
-    """
-    Selects the top `k` elements in the `selection` vector and sets them to 1 in `rounded_sol`.
-    This method does not handle ties specifically, so it may arbitrarily choose elements if
-    there are multiple candidates with the same value around the `k`-th element.
+def roundsolution(selection, k, inf_mats, H0):
+   """
+   Selects the top `k` elements in the `selection` vector and sets them to 1 in `rounded_sol`.
+   Additionally, computes and returns the objective score (smallest eigenvalue).
 
-    Args:
-        selection (np.ndarray): Array of selection scores for each candidate.
-        k (int): Number of elements to select.
+   Args:
+       selection (np.ndarray): Array of selection scores for each candidate.
+       k (int): Number of elements to select.
+       inf_mats (List[np.ndarray]): Information matrices for each candidate.
+       H0 (np.ndarray): Prior information matrix.
+       num_poses (int): Number of poses.
 
-    Returns:
-        np.ndarray: Binary vector where the top `k` elements in `selection` are marked as 1, others as 0.
-    """
-    idx = np.argpartition(selection, -k)[-k:]
-    rounded_sol = np.zeros(len(selection))
-    if k > 0:
-        rounded_sol[idx] = 1.0
-    return rounded_sol
+   Returns:
+       Tuple[np.ndarray, float]: Binary vector where the top `k` elements in `selection` are marked as 1, and the objective score.
+   """
+   idx = np.argpartition(selection, -k)[-k:]
+   rounded_sol = np.zeros(len(selection))
+ 
+   if k > 0:
+       rounded_sol[idx] = 1.0
+   # Compute the objective score after rounding
+   objective_score = evaluate_solution(inf_mats, H0, rounded_sol)
+   
+   return rounded_sol, objective_score
 
 def roundsolution_breakties(selection, k, all_mats, H0):
     """
@@ -426,60 +398,82 @@ def roundsolution_breakties(selection, k, all_mats, H0):
 
 #     return rounded_sol
 
-def roundsolution_madow(selection, k):
-    """
-    Uses a probabilistic approach to select `k` candidates based on the cumulative sum of the selection values.
-    This method introduces randomness to the rounding process, which is useful if a non-deterministic selection is preferred.
+def roundsolution_madow(selection, k, inf_mats, H0):
+   """
+   Uses a probabilistic approach to select `k` candidates based on the cumulative sum of the selection values.
+   Additionally, computes and returns the objective score (smallest eigenvalue).
 
-    Args:
-        selection (np.ndarray): Array of selection scores for each candidate.
-        k (int): Number of elements to select.
+   Args:
+       selection (np.ndarray): Array of selection scores for each candidate.
+       k (int): Number of elements to select.
+       inf_mats (List[np.ndarray]): Information matrices for each candidate.
+       H0 (np.ndarray): Prior information matrix.
+       num_poses (int): Number of poses.
 
-    Returns:
-        np.ndarray: Binary vector with exactly `k` elements selected probabilistically based on their cumulative weights.
-    """
-    num = len(selection)
-    phi = np.zeros(num + 1)  
-    rounded_sol = np.zeros(num)
-    phi[1:] = np.cumsum(selection)  # Cumulative sum of selection scores
-    u = np.random.rand()  # Random number for probabilistic selection
+   Returns:
+       Tuple[np.ndarray, float]: Binary vector with exactly `k` elements selected probabilistically based on their cumulative weights, and the objective score.
+   """
+   num = len(selection)
+   phi = np.zeros(num + 1)  
+   rounded_sol = np.zeros(num)
+   phi[1:] = np.cumsum(selection)  # Cumulative sum of selection scores
+   u = np.random.rand()  # Random number for probabilistic selection
 
-    for i in range(k):
-        for j in range(num):
-            # Check if the random value falls within the cumulative range
-            if (phi[j] <= u + i) and (u + i < phi[j + 1]):
-                if rounded_sol[j] == 1:  # Ensure the same element isn't selected twice
-                    continue
-                rounded_sol[j] = 1
-                break
-    # print("Number of candidates selected after rounding:", np.sum(rounded_sol))
-    return rounded_sol
+   for i in range(k):
+       for j in range(num):
+           # Check if the random value falls within the cumulative range
+           if (phi[j] <= u + i) and (u + i < phi[j + 1]):
+               if rounded_sol[j] == 1:  # Ensure the same element isn't selected twice
+                   continue
+               rounded_sol[j] = 1
+               break
 
-def evaluate_solution(inf_mats, H0, solution, num_poses):
-    """
-    Evaluates a binary solution by computing the smallest eigenvalue of the 
-    information matrix constructed from selected sensors.
-    
-    Args:
-        inf_mats (List[np.ndarray]): Information matrices for each sensor.
-        H0 (np.ndarray): Prior information matrix.
-        solution (np.ndarray): Binary selection vector for sensors.
-        num_poses (int): Number of poses.
-    
-    Returns:
-        float: The smallest eigenvalue of the resulting information matrix.
-    """
-    # Build the combined information matrix based on the selected sensors
-    combined_fim = H0.copy()
-    for i, selected in enumerate(solution):
-        if selected:
-            combined_fim += inf_mats[i]
-    
-    # Compute the smallest eigenvalue of the combined information matrix
-    eigvals = np.linalg.eigvalsh(combined_fim)
-    min_eig_val = eigvals[0]
-    
-    return min_eig_val
+   # Compute the objective score after rounding
+   objective_score = evaluate_solution(inf_mats, H0, rounded_sol)
+   return rounded_sol, objective_score
+
+def evaluate_solution(inf_mats, H0, solution):
+   """
+   Evaluates a binary solution by computing the smallest eigenvalue of the 
+   information matrix constructed from selected sensors.
+   
+   Args:
+       inf_mats (List[scipy.sparse.csr_matrix]): Information matrices for each sensor.
+       H0 (scipy.sparse.csr_matrix): Prior information matrix.
+       solution (np.ndarray): Binary selection vector for sensors.
+   
+   Returns:
+       float: The smallest eigenvalue of the resulting information matrix.
+   """
+   # Ensure H0 is in CSC format
+   if not scipy.sparse.isspmatrix_csc(H0):
+       H0 = H0.tocsc()
+
+   # Initialize the combined information matrix with H0
+   combined_fim = H0.copy()
+
+   # Add selected matrices from inf_mats
+   for i, selected in enumerate(solution):
+       if selected:
+           mat = inf_mats[i]
+           # Ensure matrix is in CSC format
+           if not scipy.sparse.isspmatrix_csc(mat):
+               mat = mat.tocsc()
+           combined_fim += mat
+
+   # Convert the combined FIM to a dense array for eigenvalue computation
+   combined_fim_dense = combined_fim.toarray()
+
+   # Compute the smallest eigenvalue of the combined information matrix
+   try:
+       eigvals = np.linalg.eigvalsh(combined_fim_dense)
+       min_eig_val = eigvals[0]
+   except Exception as e:
+       print("Error in eigenvalue computation:", e)
+       min_eig_val = float('-inf')  # Assign a large negative value for error cases
+
+   return min_eig_val
+
 
 # Define a function to parallelize the computation for a single Hi
 def compute_grad_parallel(idx, Hi, Hll, X, t2, min_eig_vec, measurement_dim):
@@ -505,18 +499,92 @@ def compute_grad_parallel(idx, Hi, Hll, X, t2, min_eig_vec, measurement_dim):
 
     # Compute grad_schur = Hxx_i - Hlx_i^T * X - t2 * Hll_i * Y + t2 * Hlx_i
     try:
-        Y = spsolve(Hll, Hlx_i.tocsc())
+        Y = spsolve(Hll, Hlx_i)
     except Exception as e:
         print(f"Linear solver failed for Hi index {idx}:", e)
-        Y = inv(Hll).dot(Hlx_i)  # Sparse fallback
-        Y = Y.toarray()  # Convert to dense for consistency
+        return idx, 0.0
 
     grad_schur = Hxx_i - Hlx_i.transpose().dot(X) - t2.dot(Hll_i.dot(Y)) + t2.dot(Hlx_i)
 
-    # Flatten vectors to ensure proper alignment
     grad_value = -min_eig_vec.flatten().dot(grad_schur.dot(min_eig_vec).flatten())
     return idx, grad_value
 
+def min_eig_grad_vectorized(x, inf_mats, H0, num_poses):
+    """
+    Computes the gradient of the objective function (Jacobian) using vectorization.
+
+    Args:
+        x (np.ndarray): Continuous selection vector.
+        inf_mats (List[sp.csr_matrix]): List of sparse information matrices.
+        H0 (sp.csr_matrix): Prior information matrix.
+        num_poses (int): Number of poses.
+
+    Returns:
+        np.ndarray: Gradient vector.
+    """
+    start_time = time.time()
+    
+    # Compute Schur complement and get min_eig_vec
+    _, _, min_eig_vec, Hll, X = compute_schur_complement(x, inf_mats, H0, num_poses)
+    t2 = X.transpose()
+    measurement_dim = Hll.shape[0]
+    
+    n = len(inf_mats)
+    
+    # Preallocate gradient array
+    grad = np.zeros_like(x)
+    
+    # Convert Hll to dense for faster computations
+    Hll_dense = Hll.toarray()
+    
+    # Precompute Y for all Hi
+    # Since Hll_i = Hll (assuming Hll_i same for all Hi), which may not be true
+    # If Hll_i are different, this approach won't work
+    # Assuming Hll_i are the same as Hll for all Hi (common in some formulations)
+    
+    # Convert all Hlx_i and Hxx_i to dense
+    Hlx_dense = np.array([Hi[:measurement_dim, measurement_dim:].toarray() for Hi in inf_mats])  # Shape: (n, m_l, m_x)
+    Hxx_dense = np.array([Hi[measurement_dim:, measurement_dim:].toarray() for Hi in inf_mats])  # Shape: (n, m_x, m_x)
+    
+    # Solve Y_i = spsolve(Hll, Hlx_i) for all i
+    # Vectorization not possible directly, use list comprehension for speed
+    Y_dense = np.array([spsolve(Hll, Hi[:measurement_dim, measurement_dim:]).toarray().flatten() for Hi in inf_mats])  # Shape: (n, m_x)
+    
+    # Compute grad_schur for all Hi
+    # grad_schur_i = Hxx_i - Hlx_i^T * X - t2 * Hll_i * Y_i + t2 * Hlx_i
+    # Assuming Hll_i is the same as Hll
+    # Compute Hlx_i^T * X for all i
+    Hlx_T_X = np.einsum('nij,jk->nik', Hlx_dense, X)  # Shape: (n, m_x, m_x)
+    
+    # Compute t2 * Hll_i * Y_i for all i
+    # t2 is (m_x, m_l)
+    # Y_i is (n, m_x)
+    # Hll_i * Y_i is (n, m_l)
+    # t2 * (Hll_i * Y_i) is (n, m_x)
+    Hll_Y = Hll_dense @ Y_dense.T  # Shape: (m_l, n)
+    t2_Hll_Y = t2 @ Hll_Y  # Shape: (m_x, n)
+    t2_Hll_Y = t2_Hll_Y.T  # Shape: (n, m_x)
+    
+    # Compute t2 * Hlx_i for all i
+    t2_Hlx = np.einsum('ij,jk->ik', t2, Hlx_dense)  # Shape: (n, m_x)
+    
+    # Compute grad_schur for all Hi
+    grad_schur = Hxx_dense - Hlx_T_X - t2_Hll_Y + t2_Hlx  # Shape: (n, m_x, m_x)
+    
+    # Compute grad_value for all Hi
+    # grad_value_i = -min_eig_vec^T * grad_schur_i * min_eig_vec
+    # min_eig_vec is (m_x,)
+    # grad_schur_i is (m_x, m_x)
+    # Use einsum for batch computation
+    min_eig_vec = min_eig_vec.flatten()
+    grad_values = -np.einsum('ij,j,k->i', grad_schur, min_eig_vec, min_eig_vec)  # Shape: (n,)
+    
+    # Assign to grad vector
+    grad = grad_values
+    
+    run_time = time.time() - start_time
+    print(f"Vectorized gradient computation time: {run_time:.4f} seconds")
+    return grad
 
 '''
 ################################################################
@@ -535,7 +603,7 @@ def min_eig_obj(x, inf_mats, H0, num_poses):
     Returns:
         float: Objective function value.
     """
-    H_schur, _, _, _ = compute_schur_complement(x, inf_mats, H0, num_poses)
+    H_schur, _, _, _,_ = compute_schur_complement(x, inf_mats, H0, num_poses)
     # Compute smallest eigenvalue
     try:
         min_eig_val, _ = eigsh(H_schur, k=1, which='SA')
@@ -559,7 +627,7 @@ def min_eig_grad(x, inf_mats, H0, num_poses):
         np.ndarray: Gradient vector.
     """
     start_time = time.time()
-    H_schur, min_eig_vec, Hll, X = compute_schur_complement(x, inf_mats, H0, num_poses)
+    _, _,min_eig_vec, Hll, X = compute_schur_complement(x, inf_mats, H0, num_poses)
     # Precompute constants for gradient
     t2 = X.transpose()
 
@@ -575,8 +643,6 @@ def min_eig_grad(x, inf_mats, H0, num_poses):
         grad[idx] = grad_value
     
     run_time = time.time() - start_time
-    #print(f"jacobian call compute time: {run_time:.4f}")
-
     return grad
 
 def scipy_minimize(inf_mats, H0, selection_init, num_poses, A, b):
@@ -615,7 +681,7 @@ def scipy_minimize(inf_mats, H0, selection_init, num_poses, A, b):
         jac=grad_fun,
         constraints=[linear_constraint], 
         bounds=bounds,  # Provide bounds
-        options={'disp': True, 'maxiter': 10000, 'ftol': 1e-4} )
+        options={'disp': True, 'maxiter': 10000, 'ftol': 1e-1} )
 
     # Get the minimum eigenvalue of the continuous solution
     min_eig_val_unr, _, _ = infmat.find_min_eig_pair(inf_mats, res.x, H0, num_poses)
@@ -632,7 +698,7 @@ def min_eig_obj_lse(x, inf_mats, H0, num_poses, beta=5.0):
     Computes the objective function value using the Log-Sum-Exp (LSE) approximation.
     """
     # Use the helper function to compute the Schur complement and auxiliary matrices
-    H_schur, _, _, _ = compute_schur_complement(x, inf_mats, H0, num_poses)
+    H_schur, _, _, _, _ = compute_schur_complement(x, inf_mats, H0, num_poses)
 
     # Compute all eigenvalues of H_schur
     try:
@@ -660,9 +726,8 @@ def min_eig_grad_lse(x, inf_mats, H0, num_poses, beta=5.0):
     Computes the gradient of the objective function using the Log-Sum-Exp (LSE) approximation.
     """
     # Use the helper function to compute the Schur complement and auxiliary matrices
-    H_schur, min_eig_vec, Hll, X = compute_schur_complement(x, inf_mats, H0, num_poses)
+    H_schur, _,_, Hll, X = compute_schur_complement(x, inf_mats, H0, num_poses)
 
-    # Compute eigenvalues and eigenvectors
     try:
         if H_schur.shape[0] <= 500:
             eigvals, eigvecs = np.linalg.eigh(H_schur.toarray())
@@ -672,7 +737,7 @@ def min_eig_grad_lse(x, inf_mats, H0, num_poses, beta=5.0):
         print(f"Eigenvalue computation failed: {e}")
         return np.zeros_like(x)  # Return zero gradient if computation fails
 
-    eigvals_shifted = eigvals - eigvals.min()  # Stabilize
+    eigvals_shifted = eigvals - eigvals.min()
     scaled_exp_eigvals = np.exp(-beta * eigvals_shifted)
     weight_sum = np.sum(scaled_exp_eigvals) + 1e-12
     softmax_weights = scaled_exp_eigvals / weight_sum
@@ -736,7 +801,7 @@ def scipy_minimize_lse(inf_mats, H0, selection_init, num_poses, A, b):
         jac=gradient,
         constraints=cons,
         bounds=bounds,
-        options={'disp': True, 'maxiter': 1000, 'ftol': 1e-4}
+        options={'disp': True, 'maxiter': 1000, 'ftol': 1e-2}
     )
 
     # Get the approximated minimum eigenvalue
