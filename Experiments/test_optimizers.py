@@ -5,7 +5,9 @@ from enum import Enum
 from scipy.sparse import random as sparse_random
 from scipy.sparse import csr_matrix, diags
 from scipy.stats import uniform
-from optimizations import (
+
+from OASIS import utilities
+from OASIS.optimizations import (
     greedy_selection,
     frank_wolfe_optimization,
     scipy_minimize,
@@ -14,13 +16,14 @@ from optimizations import (
     # roundsolution,               # Removed rounding functions
     # roundsolution_breakties,
     # roundsolution_madow,
-    gurobi_branch_and_cut
+    gurobi_branch_and_cut,
+    min_eig_obj,
+    min_eig_grad
 )
-import FIM as fim
-import pandas as pd
+
 import os
 import datetime
-import utilities
+
 
 # Define Metric Enum for selection
 class Metric(Enum):
@@ -198,7 +201,20 @@ def run_tests():
                         print(f"\nRunning {optimizer_name} for Matrix Size: {matrix_size}, k: {k}, Decision Variables: {num_matrices}")
                         
                         # Pass only required arguments based on whether constraints are needed
-                        if requires_constraints:
+                        if optimizer_name =="Frank-Wolfe":
+                            result, exec_time = time_function(
+                                optimizer_func,
+                                min_eig_obj,
+                                min_eig_grad,
+                                selection_init,
+                                A_constraint,
+                                b_constraint,
+                                inf_mats,
+                                H0,
+                                num_poses,
+
+                            )
+                        elif requires_constraints:
                             result, exec_time = time_function(
                                 optimizer_func,
                                 inf_mats=inf_mats,

@@ -1,15 +1,14 @@
 from typing import List, Optional, Tuple
 import numpy as np
-from scipy.optimize import linprog, minimize_scalar
+from scipy.optimize import linprog, minimize_scalar, line_search
 import gtsam
 import scipy
 from enum import Enum
 from enum import Enum
 
 from sympy.polys.benchmarks.bench_solvers import time_eqs_10x8
-
-import utilities
-import FIM as infmat
+from . import utilities
+from . import FIM as infmat
 import numpy as np
 import matplotlib.pyplot as plt
 from functools import partial
@@ -33,6 +32,8 @@ class Metric(Enum):
     LOGDET = 1
     MIN_EIG = 2
     MSE = 3
+
+
 #Test with dense matrices
 def compute_schur_complement_d(x, inf_mats, H0, num_poses):
     """
@@ -83,22 +84,9 @@ def compute_schur_complement_d(x, inf_mats, H0, num_poses):
 
     # Ensure H_schur is symmetric
     H_schur = (H_schur + H_schur.T) / 2
-    T2 = Hll_inv @ Hlx
-    T1 = Hlx.transpose().dot(Hll_inv)
-
-    # e1 = time.time()
-    # execution_time = e1 - s1
-    # print(f"execution time dense schur: {execution_time:.4f} seconds")
-
-    # # Compute smallest eigenvalue and eigenvector
-    # try:
-    #     v , w = scipy.linalg.eigh(H_schur)
-    #     min_eig_vec = w[:,0:1]
-    # except Exception as e:
-    #     print("Eigenvalue solver failed:", e)
-    #     min_eig_vec = np.zeros(H_schur.shape[1])
-
-    return H_schur, T1, T2, measurement_dim
+    # T2 = Hll_inv @ Hlx
+    # T1 = Hlx.transpose().dot(Hll_inv)
+    return H_schur, Hll_inv, Hlx, measurement_dim
 
 def compute_schur_complement(x, inf_mats, H0, num_poses):
     """
@@ -261,7 +249,141 @@ def greedy_selection(
     selection_vector[best_selection_indices] = 1
     return selection_vector, best_score, avail_cand
 
+"""
+Frank-wolfe Solver 
+"""
+'''
+Step size selection implementations
+1. fixed
+2. diminshing
+3. adaptive - back tracking line search
+'''
+def step_size_diminishing(gamma, grad):
+    """
+    stepsize alpha = gamma * Norm(gradient)
+    :return: alpha
+    """
+    return gamma * np.linalg.norm(grad)
 
+def step_size_backtrack(obj_func, obj_grad, x_k, d_k,*args):
+    """
+    step size based on back tracking line search that
+    satisfies the Armijo rule
+
+    :return: alpha
+    """
+    #res = line_search_wolfe2(min_eig_obj, min_eig_grad, x_k, -grad,  args=args, maxiter=50)
+    res = line_search(obj_func, obj_grad,x_k, d_k, args=args, maxiter=50, amax=1.0, c1=0.001 )
+
+
+    print("backtracking line search :")
+    print (res)
+    return res[0]
+def step_size_simple_backtrack (obj_func, obj_grad, x_k, d_k,c,b, max_iters, *args):
+    """
+        custom back tracking line search based on armijo rule
+        f(x_k+ gamma d_k) <= f(x_k) + c * gamma * <grad, d_k)
+        for frank wolfe d_k = s_k - x_k
+    """
+    gamma = 1.0
+    f_k = obj_func(x_k, *args)
+    g_k = obj_grad(x_k, *args)
+    f_k_gamma = obj_func(x_k + gamma * d_k, *args)
+    rhs = f_k + c * gamma * np.dot(g_k,d_k)
+
+    for i in range(max_iters):
+        if  f_k_gamma > rhs:
+            gamma = b * gamma
+            f_k_gamma = obj_func(x_k + gamma * d_k, *args)
+            rhs = f_k + c * gamma * np.dot(g_k, d_k)
+        else:
+            print(f"found staep size based on armijo rule : {gamma} in iterations:{i}")
+            break
+    if i == max_iters - 1:
+        gamma = None
+        print("max iterations reached but no convergence")
+
+    return gamma
+
+def compute_lipschitz_constant(x, inf_mats, H0, num_poses):
+    """
+    compute lipschitz constant of the minimum eigen value objective
+    For now assume simple eigen values
+    :param inf_mats:
+    :param H0:
+    :param num_poses:
+    :return:
+    """
+    sum_op_norm = 0
+    combined_fim = H0.copy()
+    for xi, Hi in zip(x, inf_mats):
+        combined_fim += xi * Hi
+    min_eig_val, _ = eigsh(combined_fim.tocsc(), k=2, which='SA')
+    delta = min_eig_val[1] - min_eig_val[0]
+
+    for Hi in inf_mats:
+        max_eig_val, _ = eigsh(Hi.tocsc(), k=1, which='LA')
+        sum_op_norm = sum_op_norm + max_eig_val
+
+    L = 4* (1.0/ delta) * sum_op_norm
+    print("lipschitz constant =", L)
+    return L
+
+
+def step_size_lipschitz(x, g_k,d_k, inf_mats, H0, num_poses ):
+    L = compute_lipschitz_constant(x, inf_mats, H0, num_poses)
+    step_size = min(1, g_k/(L * np.linalg.norm(d_k)**2))
+    print(f'step size based on lipschitz constant : {step_size}')
+    return step_size
+'''
+End of step size selection implementation
+'''
+'''
+Checking Stationarity of the solution at current iteration
+'''
+import cvxpy as cp
+def check_stationarity(r, M_primes, A):
+    #Define the variables
+    #r - multiplicity of the eigen values
+    j = A.shape[0] # number of active constraints
+    #n = M_primes.shape[0]
+
+    U = cp.Variable(shape=(r, r), PSD=True) # U is a symmetric matrix
+
+
+    constraints = []
+    constraints += [np.eye(r) - U >> 0] # This is 0 <=U<=I or I -U >= 0
+    constraints += [cp.trace(U) == 1]  # tr(U) = 1
+    if j != 0:
+        lamda = cp.Variable(j)
+        constraints += [lamda >= 0]
+        #objective function
+        ATlamda = A.transpose() @ lamda  #this should be a vector of A.shape[1]
+
+
+    tmp = []
+    for M in M_primes:
+        tmp.append(cp.trace(M @ U))
+    M_res = cp.hstack(tmp) # residual corresponding to subdifferential
+    res = M_res  # sum of subdiff residual and norm cone
+    if j != 0:
+        res = res+ATlamda
+        print(f" ATlamda : {ATlamda},Mres : {M_res},")
+
+    objective = cp.Minimize(cp.norm(res, 2)) # minmizing the l2-norm
+
+
+    prob = cp.Problem(objective, constraints)
+    prob.solve(solver=cp.MOSEK)
+    print("status =", prob.status)
+    print("optimal value =", prob.value)
+    print("U solution =", U.value)
+    if j != 0:
+        print("Lambda solution =", lamda.value)
+
+'''
+End of stationarity check
+'''
 def solve_lmo(grad, A, b):
     """
     Solves the Linear Minimization Oracle (LMO) problem for Frank-Wolfe optimization.
@@ -274,13 +396,17 @@ def solve_lmo(grad, A, b):
     Returns:
         np.ndarray or None: Solution vector if the optimization succeeds; otherwise, None.
     """
-    num_sensors = len(grad)
+    if A is not None:
+        # Convert A to CSC format
+        A = sp.csc_matrix(A)
+    dim= len(grad)
 
     # Define bounds for all variables between 0 and 1
-    bounds = [(0, 1) for _ in range(num_sensors)]
+    bounds = [(0, 1) for _ in range(dim)]
 
     # Use `linprog` from scipy to solve the LMO
     res = linprog(c=grad, A_ub=A, b_ub=b, bounds=bounds, method='highs')
+    #res = linprog(c=grad, A_eq=A, b_eq=b, bounds=bounds, method='highs')
 
     if res.success:
         return res.x
@@ -290,12 +416,13 @@ def solve_lmo(grad, A, b):
 
 
 def frank_wolfe_optimization(
-    inf_mats: List[csr_matrix],
-    H0: csr_matrix,
+    obj_func,
+    obj_grad,
     selection_init: np.ndarray,
-    num_poses: int,
     A: np.ndarray,
-    b: np.ndarray
+    b: np.ndarray,
+    *args
+
 ) -> Tuple[np.ndarray, float, int]:
     """
     Performs Frank-Wolfe optimization to select sensors that maximize the smallest eigenvalue of the Schur complement.
@@ -313,87 +440,90 @@ def frank_wolfe_optimization(
     Returns:
         Tuple[np.ndarray, float, int]: Final selection vector, best score (smallest eigenvalue), and number of iterations.
     """
+    # intermediate results for plotting
+    fw_log = {"iter": [],
+              "x": []}
+    prev_min_eig = -np.inf  # Initialize to negative infinity for maximization
 
-    H0 = H0.tocsc()
-    inf_mats = [Hi.tocsc() for Hi in inf_mats]
-    
-    # Convert A to CSC format
-    A = sp.csc_matrix(A)
     # Initialize selection vector as a continuous variable (float)
     selection_cur = selection_init.copy().astype(float)
-    prev_min_eig = -np.inf  # Initialize to negative infinity for maximization
-    
+
     for iteration in range(1000):
-        # Combine the Fisher Information Matrices based on current selection
-        combined_fim = H0.copy().tocsc()
-        for idx, sel in enumerate(selection_cur):
-            combined_fim += sel * inf_mats[idx]
-        
-        # Compute the Schur complement and minimum eigenvalue
-        try:
-            pose_dim = 6  # Adjust if different
-            num_pose_elements = num_poses * pose_dim
-            total_size = combined_fim.shape[0]
-            measurement_dim = total_size - num_pose_elements
+        # Compute objective and gradient
+        min_eig_val = obj_func(selection_cur, *args )
+        grad = obj_grad(selection_cur, *args)
 
-            Hll = combined_fim[:measurement_dim, :measurement_dim].tocsc()
-            Hlx = combined_fim[:measurement_dim, measurement_dim:].tocsc()
-            Hxx = combined_fim[measurement_dim:, measurement_dim:].tocsc()
-
-            # Solve Hll * X = Hlx
-            X = spsolve(Hll, Hlx).toarray()
-
-            # Compute Schur complement
-            H_schur = Hxx - Hlx.transpose().dot(X)
-
-            # Ensure symmetry
-            H_schur = (H_schur + H_schur.T) / 2
-
-            # Compute the smallest eigenvalue and corresponding eigenvector
-            min_eig_val, min_eig_vec = eigsh(H_schur, k=1, which='SA')
-            min_eig_val = min_eig_val[0]
-            min_eig_vec = min_eig_vec[:, 0]
-        except Exception as e:
-            print(f"Error during Schur complement or eigenvalue computation at iteration {iteration}: {e}")
-            break
-
-        # Check for convergence
-        if abs(min_eig_val - prev_min_eig) < 1e-4:
-            print(f"Converged at iteration {iteration}")
-            break
-        prev_min_eig = min_eig_val
-
-        # Compute gradient
-        try:
-            H_schur, min_eig_vec, T1, T2, measurement_dim = compute_schur_complement(selection_cur, inf_mats, H0, num_poses)
-
-            # Parallelized gradient computation
-            results = Parallel(n_jobs=-1)(
-                delayed(compute_grad_parallel)(idx, Hi, T1, T2, min_eig_vec, measurement_dim)
-                for idx, Hi in enumerate(inf_mats)
-            )
-
-            grad = np.zeros_like(selection_cur)
-            for idx, grad_value in results:
-                grad[idx] = grad_value
-        except Exception as e:
-            print(f"Error during gradient computation at iteration {iteration}: {e}")
-            break
-
-        # Solve the Linear Minimization Oracle (LMO)
+        # Solve the Linear Minimization Oracle (LMO),Solve direction finding sub problem
         s = solve_lmo(grad, A, b)
+
         if s is None:
             print(f"LMO failed to find a feasible solution at iteration {iteration}.")
             break
+        fw_log["iter"].append(iteration)
+        fw_log["x"].append(selection_cur.tolist())
+        d = s - selection_cur
 
-        # Update step size (classic Frank-Wolfe step size: 2/(t+2))
-        alpha = 2 / (iteration + 2)
+        # Check for convergence based on termination criteria
+        # if abs(min_eig_val - prev_min_eig) < 1e-4:
+        #     print(f"Converged at iteration {iteration}")
+        #     break
+
+        if np.linalg.norm(grad) < 1e-5:
+            print(f"Converged at iteration {iteration}, gradient norm: {np.linalg.norm(grad)}")
+            break
+
+        if -grad @ d < abs(min_eig_val)*1e-05:
+            print(s)
+            print(selection_cur)
+            print(f"Converged at iteration {iteration}, gradient norm: {np.linalg.norm(grad)}, duality gap minimized")
+            break
+
+        prev_min_eig = min_eig_val
+
+        # Get step size (classic Frank-Wolfe step size: 2/(t+2))
+        alpha_dim = step_size_diminishing(0.1, grad)
+        alpha_bt = 2.0 / (iteration + 2)
+        '''
+        Different step size calculations
+        '''
+        #alpha_bt = step_size_backtrack(obj_func, obj_grad, selection_cur, d, *args)
+        #alpha_lipschitz = step_size_lipschitz(selection_cur, -grad @ d, d, *args)
+        #alpha_bt=step_size_simple_backtrack(obj_func, obj_grad, selection_cur, d, 0.0001, 0.5, 100, *args)
+        print(f"Iteration : {iteration}, alpha = {alpha_bt}, f(x): {min_eig_val}, gradient norm = {np.linalg.norm(grad)}, duality gap:{grad @ (s - selection_cur)}")
 
         # Update the selection vector
-        selection_cur = selection_cur + alpha * (s - selection_cur)
+        selection_cur = selection_cur + alpha_bt * (s - selection_cur)
+        print("solution current")
+        print(selection_cur)
         selection_cur = np.clip(selection_cur, 0, 1)
+    #check the stationarity of the final solution
 
-    return selection_cur, min_eig_val, iteration + 1
+    # M_primes is a set of products QT*M_i*Q
+    inf_mats = args[0]
+
+    combined_fim = args[1].copy()
+
+    for xi, Hi in zip(selection_cur, inf_mats):
+        combined_fim += xi * Hi
+    eig_vals, min_eig_vecs = eigsh(combined_fim, k=10, which='SA') # I am just selecting 10, ideally we dont know how many are repeating
+    # print(eig_vals)
+    # print(min_eig_vecs[:, 0:1].transpose().shape)
+    uniq_eigs = np.unique(eig_vals)
+    uniq_inds = np.isclose(eig_vals, uniq_eigs)
+    uniq_eig_vecs = min_eig_vecs[:, 0:1]
+    if np.sum(uniq_inds) > 1:
+        uniq_eig_vecs= min_eig_vecs[:, uniq_inds]
+
+    M_primes = []
+    for i in inf_mats:
+        M_p = - uniq_eig_vecs[:, 0:1].transpose() @ i @ uniq_eig_vecs[:, 0:1]
+        M_primes.append(M_p)
+    #check which the constraints are active
+    active_inds = np.isclose(np.abs(A@selection_cur-b), np.zeros(b.shape[0]), atol=1e-4)
+    print("Active constraints =", np.where(active_inds==True))
+
+    check_stationarity(1, M_primes, A[active_inds])
+    return selection_cur, min_eig_val, iteration + 1, fw_log
 
 
 def roundsolution(selection, k):
@@ -607,10 +737,17 @@ def min_eig_obj(x, inf_mats, H0, num_poses):
     Returns:
         float: Objective function value.
     """
-    H_schur, _, _, _ = compute_schur_complement(x, inf_mats, H0, num_poses)
+    H0 = H0.tocsc()
+    inf_mats = [Hi.tocsc() for Hi in inf_mats]
+    #H_schur, _, _, _,_ = compute_schur_complement(x, inf_mats, H0, num_poses)
+    H_schur = H0.copy()
+    for xi, Hi in zip(x, inf_mats):
+        H_schur += xi * Hi
     # Compute smallest eigenvalue
     try:
-        min_eig_val, _ = eigsh(H_schur, k=1, which='SA')
+        min_eig_val, _ = eigsh(H_schur, k=2, which='SA')
+        # print("eigen values")
+        # print(min_eig_val)
     except Exception as e:
         print("Eigenvalue solver failed:", e)
         min_eig_val = [0.0]
@@ -645,6 +782,35 @@ def min_eig_grad(x, inf_mats, H0, num_poses):
     
     run_time = time.time() - start_time
     #print(f"jacobian call compute time: {run_time:.4f}")
+
+    return grad
+
+
+def min_eig_grad_noschur(x, inf_mats, H0, num_poses):
+    """
+    Computes the gradient of the objective function (Jacobian).
+
+    Args:
+        x (np.ndarray): Continuous selection vector.
+        inf_mats (List[scipy.sparse.csr_matrix]): List of sparse information matrices.
+        H0 (scipy.sparse.csr_matrix): Prior information matrix.
+        num_poses (int): Number of poses.
+
+    Returns:
+        np.ndarray: Gradient vector.
+    """
+    start_time = time.time()
+    combined_fim = H0.copy()
+    for xi, Hi in zip(x, inf_mats):
+        combined_fim += xi * Hi
+    min_eig_val, min_eig_vec = eigsh(combined_fim, k=1, which='SA')
+    grad = np.zeros_like(x)
+    for idx, Hi in enumerate(inf_mats):
+        grad_value = -min_eig_vec.flatten().dot(Hi.dot(min_eig_vec).flatten())
+        grad[idx] = grad_value
+
+    run_time = time.time() - start_time
+    # print(f"jacobian call compute time: {run_time:.4f}")
 
     return grad
 
@@ -731,7 +897,7 @@ def min_eig_grad_lse_d(x, inf_mats, H0, num_poses, beta=5.0):
     """
     # Use the helper function to compute the Schur complement and auxiliary matrices
     s=time.time()
-    H_schur, T1, T2, measurement_dim = compute_schur_complement_d(x, inf_mats, H0, num_poses)
+    H_schur, H_ll_inv, H_lx, measurement_dim = compute_schur_complement_d(x, inf_mats, H0, num_poses)
 
     # Compute eigenvalues and eigenvectors
     try:
@@ -755,17 +921,29 @@ def min_eig_grad_lse_d(x, inf_mats, H0, num_poses, beta=5.0):
         Hll_j_d = H_j[:measurement_dim, :measurement_dim]
         Hlx_j_d = H_j[:measurement_dim, measurement_dim:]
         Hxx_j_d = H_j[measurement_dim:, measurement_dim:]
-        grad_schur_d = Hxx_j_d - Hlx_j_d.T @ T2 + T1 @ Hll_j_d @ T2 - T1 @ Hlx_j_d
 
+        grad_schur_d = Hxx_j_d - Hlx_j_d.T @ H_ll_inv@H_lx + H_lx.T @ H_ll_inv @ Hll_j_d @ H_ll_inv@H_lx - H_lx.T @ H_ll_inv @ Hlx_j_d
         lambda_derivatives_d = np.array([
             eigvecs[:, i].T @ grad_schur_d @ eigvecs[:, i]
             for i in range(len(eigvals))
         ])
+        e1 = time.time()
+        execution_time = e1 - s1
+        print(f"execution time grad schur computation dense : {execution_time:.4f} seconds")
+        s2 = time.time()
+        lambda_derivatives_d_fast = np.zeros(len(eigvals))
+        for i in range(len(eigvals)):
+            v = eigvecs[:, i:i+1]
+            tmp1 = H_lx @ v
+            tmp2 = H_ll_inv @ tmp1
+            grad_schur_d = Hxx_j_d @ v - Hlx_j_d.T @ tmp2 + H_lx.T @ (H_ll_inv @ (Hll_j_d @ tmp2)) - H_lx.T @ (H_ll_inv @ (Hlx_j_d @ v))
+            lambda_derivatives_d_fast[i]=  v.T @ grad_schur_d
 
+        assert (np.allclose(lambda_derivatives_d,lambda_derivatives_d_fast))
         tmp_d = np.sum(softmax_weights * lambda_derivatives_d)
-        # e1 = time.time()
-        # execution_time = e1 - s1
-        # print(f"execution time grad schur computation dense : {execution_time:.4f} seconds")
+        e2 = time.time()
+        execution_time = e2 - s2
+        print(f"execution time grad schur computation dense fast : {execution_time:.4f} seconds")
 
         return idx, tmp_d
     s1 = time.time()
