@@ -1,350 +1,605 @@
 import numpy as np
 import time
-import yaml
-from enum import Enum
-from scipy.sparse import random as sparse_random
-from scipy.sparse import csr_matrix, diags
-from scipy.stats import uniform
-from optimizations import (
-   greedy_selection,
-   frank_wolfe_optimization,
-   scipy_minimize,
-   scipy_minimize_lse,
-   roundsolution_madow,
-   roundsolution
-)
-import FIM as fim
-import pandas as pd
 import os
 import datetime
-import utilities
+import matplotlib.pyplot as plt
+from enum import Enum
+from scipy.sparse import csr_matrix, diags, random
 
-# Define Metric Enum for selection
+# Import your optimization functions (assumed to be defined in optimizations.py)
+from optimizations import (
+    greedy_selection,
+    cvxpy_minimize_lse,
+    multiple_randomized_rounds,
+    compute_variance_info,
+    evaluate_solution
+)
+import utilities  # assumed to provide utilities.check_symmetric
+
+# Define Metric Enum for selection (if used in greedy_selection)
 class Metric(Enum):
-   LOGDET = 1
-   MIN_EIG = 2
-   MSE = 3
+    LOGDET = 1
+    MIN_EIG = 2
+    MSE = 3
 
-def generate_random_fim(num_matrices, matrix_size, density=0.1, min_eigenvalue=50.0, random_state=40):
-   """
-   Generates a list of random sparse symmetric positive-definite matrices.
-   """
-   np.random.seed(random_state)
-   inf_mats = []
+def generate_fim(num_matrices, matrix_size, generator_type="random", density=0.1,
+                 min_eigenvalue=2.0, random_state=40, **kwargs):
+    """
+    Generates a list of random sparse symmetric positive-definite matrices
+    according to the chosen generator type.
 
-   for i in range(num_matrices):
-       # Generate a random sparse matrix B with standard normal distributed non-zero entries
-       B = sparse_random(matrix_size, matrix_size, density=density, format='csr', 
-                         data_rvs=np.random.randn)
-       # Compute A = B^T + B to ensure positive semi-definiteness
-       A = B.transpose().dot(B)
-       # A = B.transpose() + B
+    Parameters
+    ----------
+    num_matrices : int
+        Total number of matrices to generate.
+    matrix_size : int
+        Size of each matrix.
+    generator_type : str, optional
+        Type of generation. Options:
+         - "incremental": Uses sparse random matrices with min eigenvalues increasing by a fixed increment.
+         - "random": Generates matrices with completely random eigenvalues, chosen uniformly from [low, high].
+         - "two_group": Generates matrices in two groups: a fraction have min eigenvalue = group1_min and the rest have min eigenvalue = group2_min.
+    density : float, optional
+        Density used for sparse generation (only for "incremental").
+    min_eigenvalue : float, optional
+        Starting minimum eigenvalue (for "incremental").
+    random_state : int, optional
+        Seed for reproducibility.
+    **kwargs : dict
+        Additional parameters for the "random" and "two_group" generators.
 
-       # Add c*I to make it positive definite
-       c = min_eigenvalue
-       A += diags([c] * matrix_size, format='csr')
-       assert utilities.check_symmetric(A)
-       #print(A.getnnz()/np.prod(A.shape))
-       inf_mats.append(A)
+    Returns
+    -------
+    inf_mats : list of sparse matrices
+        A shuffled list of generated matrices (in CSR format).
+    """
+    np.random.seed(random_state)
+    inf_mats = []
 
-   return inf_mats
+    if generator_type == "incremental":
+        current_min_eigenvalue = min_eigenvalue
+        for i in range(num_matrices):
+            B = random(matrix_size, matrix_size, density=density, format='csr', data_rvs=np.random.randn)
+            A = B.transpose().dot(B)
+            A += diags([current_min_eigenvalue] * matrix_size, format='csr')
+            assert utilities.check_symmetric(A), "Matrix not symmetric"
+            inf_mats.append(A)
+            current_min_eigenvalue += 2
 
-def generate_fim_with_identity(num_matrices, matrix_size, k, density=0.1, min_eigenvalue=2.0, random_state=40):
-   """
-   Generates a list of random sparse symmetric positive-definite matrices with most being identity matrices.
-   """
-   np.random.seed(random_state)
-   inf_mats = []
+    elif generator_type == "random":
+        low = kwargs.get("low", 0.1)
+        high = kwargs.get("high", 20.0)
+        from scipy.sparse import csr_matrix
+        for i in range(num_matrices):
+            Q, _ = np.linalg.qr(np.random.randn(matrix_size, matrix_size))
+            eigvals = np.random.uniform(low, high, size=matrix_size)
+            D = np.diag(eigvals)
+            A_dense = Q @ D @ Q.T
+            A_dense = (A_dense + A_dense.T) / 2
+            A = csr_matrix(A_dense)
+            inf_mats.append(A)
 
-    
-    # Generate a predefined symmetric sparse matrix (e.g., identity + constant offset)
-   base_matrix = np.random.randn(matrix_size, matrix_size)
-   base_matrix = (base_matrix + base_matrix.T) / 2  # Ensure symmetry
-   base_matrix = csr_matrix(base_matrix)
-   base_matrix += diags([min_eigenvalue] * matrix_size, format='csr')  # Ensure PSD
+    elif generator_type == "two_group":
+        fraction_group1 = kwargs.get("fraction_group1", 0.5)
+        group1_min = kwargs.get("group1_min", 1.0)
+        group2_min = kwargs.get("group2_min", 10.0)
+        upper_bound1 = kwargs.get("upper_bound1", 20.0)
+        upper_bound2 = kwargs.get("upper_bound2", 30.0)
+        num_group1 = int(np.round(num_matrices * fraction_group1))
+        num_group2 = num_matrices - num_group1
 
-   # Generate `num_matrices - k` identity matrices
-   identity_matrix = diags([1.0] * matrix_size, format='csr')
-   for _ in range(num_matrices - k):
-       inf_mats.append(identity_matrix)
+        def generate_matrix_with_min_eig(matrix_size, min_eig, upper_bound):
+            Q, _ = np.linalg.qr(np.random.randn(matrix_size, matrix_size))
+            eigvals = np.random.uniform(min_eig, upper_bound, size=matrix_size)
+            eigvals[0] = min_eig
+            eigvals = np.sort(eigvals)
+            D = np.diag(eigvals)
+            A_dense = Q @ D @ Q.T
+            A_dense = (A_dense + A_dense.T) / 2
+            from scipy.sparse import csr_matrix
+            return csr_matrix(A_dense)
 
-    # Append `k` copies of the predefined symmetric PSD matrix
-   for _ in range(k):
-       inf_mats.append(base_matrix)
+        for i in range(num_group1):
+            A_mat = generate_matrix_with_min_eig(matrix_size, group1_min, upper_bound1)
+            inf_mats.append(A_mat)
+        for i in range(num_group2):
+            A_mat = generate_matrix_with_min_eig(matrix_size, group2_min, upper_bound2)
+            inf_mats.append(A_mat)
+    else:
+        raise ValueError("Unknown generator type: {}".format(generator_type))
 
+    # Shuffle the list reproducibly
+    perm = np.random.permutation(len(inf_mats))
+    inf_mats = [inf_mats[i] for i in perm]
+    return inf_mats
 
-   # Shuffle the matrices to ensure the random ones are not clustered at the end
-   np.random.shuffle(inf_mats)
-
-   return inf_mats
-
-# Helper function to time each optimization method
 def time_function(func, *args, **kwargs):
-   start_time = time.time()
-   result = func(*args, **kwargs)
-   end_time = time.time()
-   execution_time = end_time - start_time
-   print(f"{func.__name__} execution time: {execution_time:.4f} seconds")
-   return result, execution_time
+    import time
+    start_time = time.time()
+    result = func(*args, **kwargs)
+    end_time = time.time()
+    execution_time = end_time - start_time
+    print(f"{func.__name__} execution time: {execution_time:.4f} seconds")
+    return result, execution_time
 
-# Main testing function
-def run_tests():
-   # Define pose dimension and base measurement dimension
-   pose_dim = 6  # Each pose has 6 variables
-
-   # Define test parameters
-   density = 0.1        # 10% non-zero elements
-   min_eigenvalue = .0  # Minimum eigenvalue
-
-   # Test configurations
-   k_values = [5]
-   num_matrices_list = [20]
-   num_poses_list = [20]
-   
-   # Initialize a results array
-   # Dimensions: (num_poses, num_matrices, k_values, optimizers, metrics)
-   # Metrics indices: 0 - best_score, 1 - exec_time
-   results_n_k = np.zeros(
-       (len(num_poses_list), len(num_matrices_list), len(k_values), 4, 2)
-   )
-
-   # Mapping of optimizer names to their corresponding indices in the results_n_k array
-   optimizer_indices = {
-       "Greedy Selection": 0,
-       "Scipy Minimize LSE": 1,
-       # "Scipy Minimize LSE dense": 2,
-       "Frank-Wolfe": 2,
-       # "Gurobi Branch and Cut": 3  # Uncomment if using Gurobi
-   }
-
-   # Initialize a list to store all test case results
-   all_test_case_results = []
-
-   # Define directories for saving results
-   timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-   results_dir = os.path.join("results", timestamp)
-   os.makedirs(results_dir, exist_ok=True)
-
-   # Directory for intermediate results
-   intermediate_dir = os.path.join(results_dir, "intermediate_results")
-   os.makedirs(intermediate_dir, exist_ok=True)
-
-   # Directory for selection vectors
-   selection_vectors_dir = os.path.join(results_dir, "selection_vectors")
-   os.makedirs(selection_vectors_dir, exist_ok=True)
-
-   # Define batch size for periodic saving
-   save_interval = 1  # Save every 100 test cases
-   test_case_counter = 0  # Counter for test cases
-
-   # Iterate over configurations
-   for p_index, num_poses in enumerate(num_poses_list):
-       for n_index, num_matrices in enumerate(num_matrices_list):
-           for k_index, k in enumerate(k_values):
-               # Calculate matrix size
-               measurement_dim = num_poses
-               matrix_size = measurement_dim + num_poses * pose_dim
-
-               # Check feasibility of the configuration
-               if k >= num_matrices:
-                   print(f"Skipping test for k={k}, num_matrices={num_matrices} (k >= num_matrices)")
-                   continue
-
-               # Constraint setup for optimization methods
-               A_constraint = csr_matrix(np.ones((1, num_matrices)))  # Create A as a sparse matrix
-               b_constraint = np.array([k])
-
-               # Generate synthetic data
-               inf_mats = generate_fim_with_identity(
-                   num_matrices=num_matrices,
-                   matrix_size=matrix_size,
-                   k=k+2,
-                   density=density,
-                   min_eigenvalue=min_eigenvalue
-               )
-               H0 = diags([min_eigenvalue] * matrix_size, format='csr')
-               selection_init = np.ones(num_matrices, dtype=np.float16) / num_matrices
-
-               # Initialize a dictionary to store results for the current test case
-               test_case_result = {
-                   'configuration': {
-                       'num_poses': num_poses,
-                       'num_matrices': num_matrices,
-                       'k': k,
-                       'matrix_size': matrix_size,
-                       'density': density,
-                       'min_eigenvalue': min_eigenvalue
-                   },
-                   'results': {}
-               }
-
-           for optimizer_name, optimizer_func, requires_constraints, needs_rounding in [
-               ("Greedy Selection", greedy_selection, False, False),
-               ("Scipy Minimize LSE", scipy_minimize_lse, True, False),
-               ("Frank-Wolfe", frank_wolfe_optimization, True, False)
-               # Uncomment the line below if Gurobi is being used
-               # ("Gurobi Branch and Cut", gurobi_branch_and_cut, True, False)
-           ]:
-               try:
-                   print(f"\nRunning {optimizer_name} for Matrix Size: {matrix_size}, k: {k}, Decision Variables: {num_matrices}")
-                   
-                   # Pass only required arguments based on whether constraints are needed
-                   if requires_constraints:
-                       result, exec_time = time_function(
-                           optimizer_func,
-                           inf_mats=inf_mats,
-                           H0=H0,
-                           selection_init=selection_init,
-                           num_poses=num_poses,
-                           A=A_constraint,
-                           b=b_constraint
-                       )
-                   else:
-                       result, exec_time = time_function(
-                           optimizer_func,
-                           inf_mats=inf_mats,
-                           prior=H0,
-                           Nc=k,
-                           metric=Metric.MIN_EIG,
-                           num_runs=1,
-                           num_poses=num_poses
-                       )
-
-                   # Process results
-                   if optimizer_name == "Greedy Selection":
-                       selection_vec, best_score, _ = result
-
-                       # Print results
-                       print(f"{optimizer_name} Results (selection vector indices):", np.nonzero(selection_vec)[0])
-                       print(f"{optimizer_name} Best Score:", best_score)
-
-                       # Save selection vector to a separate file
-                       selection_filename = f"p{p_index}_n{n_index}_k{k_index}_{optimizer_name.replace(' ', '_')}.npy"
-                       selection_path = os.path.join(selection_vectors_dir, selection_filename)
-                       np.save(selection_path, selection_vec)
-
-                       # Store in test_case_result
-                       test_case_result['results'][optimizer_name] = {
-                           'execution_time': exec_time,
-                           'best_score': float(best_score),
-                           'selection_vector_path': selection_path
-                       }
-
-                   else:
-                       selection_vec = result[0]
-                       best_score = result[1]
-
-                       # Print results
-                       print(f"{optimizer_name} Results (selection vector):", selection_vec)
-                       print(f"{optimizer_name} Best Score:", best_score)
-
-                       # Save the selection vector
-                       selection_filename = f"p{p_index}_n{n_index}_k{k_index}_{optimizer_name.replace(' ', '_')}.npy"
-                       selection_path = os.path.join(selection_vectors_dir, selection_filename)
-                       np.save(selection_path, selection_vec)
-
-                       # Apply rounding methods and store results
-                       rounded_solution, rounded_score = roundsolution(selection_vec, k, inf_mats, H0)
-                       madow_solution, madow_score = roundsolution_madow(selection_vec, k, inf_mats, H0)
-                       print(f"{optimizer_name} K-Max (selection vector):", rounded_solution)
-                       print(f"{optimizer_name} K-Max Score:", rounded_score)
-                       print(f"{optimizer_name} Madow (selection vector):", madow_solution)
-                       print(f"{optimizer_name} Madow Score:", madow_score)
-
-
-                       # Save rounded solutions
-                       rounded_filename = f"p{p_index}_n{n_index}_k{k_index}_{optimizer_name}_rounded.npy"
-                       madow_filename = f"p{p_index}_n{n_index}_k{k_index}_{optimizer_name}_madow.npy"
-                       rounded_path = os.path.join(selection_vectors_dir, rounded_filename)
-                       madow_path = os.path.join(selection_vectors_dir, madow_filename)
-                       np.save(rounded_path, rounded_solution)
-                       np.save(madow_path, madow_solution)
-
-                       test_case_result['results'][optimizer_name] = {
-                           'execution_time': float(exec_time),
-                           'best_score': convert_numpy(best_score),
-                           'selection_vector_path': selection_path,
-                           'rounded_score': convert_numpy(rounded_score),
-                           'madow_score': convert_numpy(madow_score),
-                           'rounded_solution_path': rounded_path,
-                           'madow_solution_path': madow_path
-                       }
-
-               except Exception as e:
-                   print(f"{optimizer_name} failed: {e}")
-                   # Optionally, store the exception information
-                   test_case_result['results'][optimizer_name] = {
-                       'error': str(e)
-                   }
-                   # Assign np.nan to relevant entries in results_n_k
-                   optimizer_idx = optimizer_indices.get(optimizer_name)
-                   if optimizer_idx is not None:
-                       results_n_k[p_index, n_index, k_index, optimizer_idx, :] = np.nan
-
-               # Convert and append results after processing all optimizers
-               test_case_result = {k: convert_numpy(v) for k, v in test_case_result.items()}
-               all_test_case_results.append(test_case_result)
-               test_case_counter += 1
-
-               # Check if it's time to save intermediate results
-               if test_case_counter % save_interval == 0:
-                   print(f"\nSaving intermediate results after {test_case_counter} test cases...")
-                   # Define filenames with batch number
-                   batch_number = test_case_counter // save_interval
-                   intermediate_results_path = os.path.join(intermediate_dir, f"results_batch_{batch_number}.yaml")
-                   intermediate_results_n_k_path = os.path.join(intermediate_dir, f"results_n_k_batch_{batch_number}.npy")
-                   
-                   # Save the accumulated test case results
-                   with open(intermediate_results_path, "w") as f:
-                       yaml.dump(all_test_case_results, f)
-                   
-                   # Save the current state of results_n_k
-                   np.save(intermediate_results_n_k_path, results_n_k)
-                   
-                   # Reset the accumulated results
-                   all_test_case_results = []
-                   results_n_k.fill(0)  # Reset the NumPy array
-
-               # After all test cases are processed, save any remaining results
-               if all_test_case_results:
-                   print(f"\nSaving final batch of {test_case_counter % save_interval} test cases...")
-                   batch_number = (test_case_counter // save_interval) + 1
-                   intermediate_results_path = os.path.join(intermediate_dir, f"results_batch_{batch_number}.yaml")
-                   intermediate_results_n_k_path = os.path.join(intermediate_dir, f"results_n_k_batch_{batch_number}.npy")
-                   
-                   # Save the accumulated test case results
-                   with open(intermediate_results_path, "w") as f:
-                       yaml.dump(all_test_case_results, f)
-                   
-                   # Save the current state of results_n_k
-                   np.save(intermediate_results_n_k_path, results_n_k)
-
-               # Save all test case results as a YAML file for easier readability
-               with open(os.path.join(results_dir, "all_test_case_results.yaml"), "w") as f:
-                   yaml.dump(all_test_case_results, f)
-
-               # Save experiment configuration
-               exp_config = {
-                   "pose_dim": pose_dim,
-                   "num_poses_list": num_poses_list,
-                   "num_matrices_list": num_matrices_list,
-                   "k_values": k_values,
-                   "algos": ["greedy", "scipy-lse", "frank-wolfe"],  # Still working on Gurobi
-                   "metrics": ["best_score", "exec_time"]
-               }
-               with open(os.path.join(results_dir, "exp_config.yaml"), "w") as f:
-                   yaml.dump(exp_config, f)
-
-# Convert numpy objects in test_case_result to Python-native types
 def convert_numpy(obj):
-   if isinstance(obj, np.ndarray):
-       return obj.tolist()  # Convert numpy array to list
-   elif isinstance(obj, (np.float32, np.float64)):
-       return float(obj)  # Convert numpy float to Python float
-   elif isinstance(obj, (np.int32, np.int64)):
-       return int(obj)  # Convert numpy int to Python int
-   else:
-       return obj  # Return the object as-is if it's not numpy
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, (np.int32, np.int64)):
+        return int(obj)
+    return obj
 
-if __name__ == "__main__":
-   run_tests()
+def run_budget_tests():
+    """
+    For a dummy "at most K cameras" constraint (i.e. sum(x) <= K),
+    we run tests for increasing values of K (as percentages).
+    For each K:
+      1) Solve the CVXPY problem -> fractional solution + objective
+      2) compute_variance_info to get (Expectation, Variance, ratio)
+      3) multiple_randomized_rounds from the fractional solution
+      4) run greedy_selection
+      5) store + plot bar charts
+         where x-axis label is "Exp:xx.x\nVar:yy.y"
+    """
+    # Configuration
+    pose_dim = 6
+    density = 0.1
+    min_eigenvalue = 2
+    num_matrices = 100
+    num_poses = 10
+    k_percentages = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.45, 0.5, 0.55, 0.65, 0.70]
+    
+    # Arrays to store results (for plotting)
+    exps = []       # expectation from variance_info
+    vars_ = []      # variance from variance_info
+    frac_objs = []  # fractional objective
+    random_objs = []  
+    greedy_objs = []
+    
+    for perc in k_percentages:
+        k = int(round(num_matrices * perc))
+        print("\n====================================")
+        print(f"Testing with K = {k} (K = {perc*100:.0f}% of {num_matrices})")
+        print("====================================\n")
+        
+        # Single-row constraint: sum(x) <= k
+        A_constraint = csr_matrix(np.ones((1, num_matrices)))
+        b_constraint = np.array([k])
+        
+        # Matrix size
+        measurement_dim = num_poses
+        matrix_size = measurement_dim + num_poses * pose_dim
+        
+        # Generate the candidate FIMs
+        inf_mats = generate_fim(num_matrices=num_matrices,
+                                matrix_size=matrix_size,
+                                generator_type="two_group",
+                                density=density,
+                                min_eigenvalue=min_eigenvalue,
+                                random_state=42)
+        
+        # Prior matrix
+        H0 = diags([min_eigenvalue]*matrix_size, format='csr')
+        selection_init = np.ones(num_matrices, dtype=np.float16)/num_matrices
+        
+        # 1) Solve CVXPY problem
+        (frac_solution, fractional_obj), _ = time_function(
+            cvxpy_minimize_lse,
+            inf_mats=inf_mats,
+            H0=H0,
+            selection_init=selection_init,
+            num_poses=num_poses,
+            A=A_constraint,
+            b=b_constraint
+        )
+        print("Fractional solution:", frac_solution)
+        print("Fractional objective:", fractional_obj)
+        frac_objs.append(fractional_obj)
+        
+        # 2) compute_variance_info
+        #   This returns a list of (E, Var, ratio) for each row of A.
+        #   Here, p=1, so we only have variance_info[0].
+        variance_data = compute_variance_info(A_constraint.toarray(), frac_solution)
+        E_val, Var_val, ratio_val = variance_data[0]  # single row
+        exps.append(E_val)
+        vars_.append(Var_val)
+        
+        # 3) multiple_randomized_rounds from fractional solution
+        def objective_func(binary_vec):
+            return evaluate_solution(inf_mats, H0, binary_vec)
+        best_rand_y, best_rand_obj, feas_rate = multiple_randomized_rounds(
+            frac_solution, A_constraint, b_constraint, objective_func, n_samples=1000
+        )
+        print("Randomized best obj:", best_rand_obj, "(feas rate:", feas_rate, ")")
+        random_objs.append(best_rand_obj)
+        
+        # 4) run greedy_selection
+        from optimizations import greedy_selection
+        g_vec, g_obj, _ = greedy_selection(
+            inf_mats=inf_mats,
+            prior=H0,
+            Nc=k,
+            metric=Metric.MIN_EIG,
+            num_runs=1,
+            num_poses=num_poses
+        )
+        print("Greedy objective:", g_obj)
+        greedy_objs.append(g_obj)
+        
+    # Now plot results:
+    x_positions = np.arange(len(exps))
+    width = 0.25
+    
+    # Build the x-axis labels from exps, vars_
+    x_labels = [f"Exp:{exps[i]:.1f}\nVar:{vars_[i]:.1f}" for i in range(len(exps))]
+    
+    fig, ax = plt.subplots(1,2, figsize=(14,6))
+
+    # Plot objectives
+    pos_frac = x_positions - width
+    pos_rand = x_positions
+    pos_greedy = x_positions + width
+
+    ax[0].bar(pos_frac, frac_objs, width, label="Fractional", color='skyblue')
+    ax[0].bar(pos_rand, random_objs, width, label="Random Round", color='lightgreen')
+    ax[0].bar(pos_greedy, greedy_objs, width, label="Greedy", color='salmon')
+    ax[0].set_xticks(x_positions)
+    ax[0].set_xticklabels(x_labels)
+    ax[0].legend()
+    ax[0].set_xlabel("Expectation/Variance")
+    ax[0].set_ylabel("Objective Score")
+    ax[0].set_title("Objective Scores")
+
+    # Plot gap percentages
+    frac_array = np.array(frac_objs)
+    rand_gaps = 100*(frac_array - np.array(random_objs))/frac_array
+    greed_gaps = 100*(frac_array - np.array(greedy_objs))/frac_array
+
+    ax[1].bar(pos_rand, rand_gaps, width, label="Random Gap (%)", color='lightgreen')
+    ax[1].bar(pos_greedy, greed_gaps, width, label="Greedy Gap (%)", color='salmon')
+    ax[1].set_xticks(x_positions)
+    ax[1].set_xticklabels(x_labels)
+    ax[1].legend()
+    ax[1].set_xlabel("Expectation/Variance")
+    ax[1].set_ylabel("Gap (%)")
+    ax[1].set_title("Optimality Gaps")
+    
+    plt.tight_layout()
+    plt.show()
+
+if __name__=="__main__":
+    run_budget_tests()
+
+# import numpy as np
+# import time
+# import os
+# import datetime
+# import matplotlib.pyplot as plt
+# from enum import Enum
+# from scipy.sparse import csr_matrix, diags, random as sparse_random
+
+# # Import your optimization functions (assumed to be defined in optimizations.py)
+# from optimizations import (
+#     cvxpy_minimize_lse,
+#     multiple_randomized_rounds,
+#     compute_variance_info,
+#     evaluate_solution
+# )
+# import utilities  # assumed to provide utilities.check_symmetric
+
+# # Define Metric Enum for selection (if used elsewhere)
+# class Metric(Enum):
+#     LOGDET = 1
+#     MIN_EIG = 2
+#     MSE = 3
+
+# def generate_fim(num_matrices, matrix_size, generator_type="random", density=0.1,
+#                  min_eigenvalue=2.0, random_state=40, **kwargs):
+#     """
+#     Generates a list of random sparse symmetric positive-definite matrices
+#     according to the chosen generator type.
+#     """
+#     np.random.seed(random_state)
+#     inf_mats = []
+
+#     if generator_type == "incremental":
+#         current_min_eigenvalue = min_eigenvalue
+#         for i in range(num_matrices):
+#             B = sparse_random(matrix_size, matrix_size, density=density, format='csr', data_rvs=np.random.randn)
+#             A = B.transpose().dot(B)
+#             A += diags([current_min_eigenvalue] * matrix_size, format='csr')
+#             assert utilities.check_symmetric(A), "Matrix not symmetric"
+#             inf_mats.append(A)
+#             current_min_eigenvalue += 2
+
+#     elif generator_type == "random":
+#         low = kwargs.get("low", 0.1)
+#         high = kwargs.get("high", 20.0)
+#         from scipy.sparse import csr_matrix
+#         for i in range(num_matrices):
+#             Q, _ = np.linalg.qr(np.random.randn(matrix_size, matrix_size))
+#             eigvals = np.random.uniform(low, high, size=matrix_size)
+#             D = np.diag(eigvals)
+#             A_dense = Q @ D @ Q.T
+#             A_dense = (A_dense + A_dense.T) / 2
+#             A = csr_matrix(A_dense)
+#             inf_mats.append(A)
+
+#     elif generator_type == "two_group":
+#         fraction_group1 = kwargs.get("fraction_group1", 0.5)
+#         group1_min = kwargs.get("group1_min", 1.0)
+#         group2_min = kwargs.get("group2_min", 10.0)
+#         upper_bound1 = kwargs.get("upper_bound1", 20.0)
+#         upper_bound2 = kwargs.get("upper_bound2", 30.0)
+#         num_group1 = int(np.round(num_matrices * fraction_group1))
+#         num_group2 = num_matrices - num_group1
+
+#         def generate_matrix_with_min_eig(matrix_size, min_eig, upper_bound):
+#             Q, _ = np.linalg.qr(np.random.randn(matrix_size, matrix_size))
+#             eigvals = np.random.uniform(min_eig, upper_bound, size=matrix_size)
+#             eigvals[0] = min_eig
+#             eigvals = np.sort(eigvals)
+#             D = np.diag(eigvals)
+#             A_dense = Q @ D @ Q.T
+#             A_dense = (A_dense + A_dense.T) / 2
+#             from scipy.sparse import csr_matrix
+#             return csr_matrix(A_dense)
+
+#         for i in range(num_group1):
+#             A_mat = generate_matrix_with_min_eig(matrix_size, group1_min, upper_bound1)
+#             inf_mats.append(A_mat)
+#         for i in range(num_group2):
+#             A_mat = generate_matrix_with_min_eig(matrix_size, group2_min, upper_bound2)
+#             inf_mats.append(A_mat)
+#     else:
+#         raise ValueError("Unknown generator type: {}".format(generator_type))
+
+#     # Shuffle the list reproducibly
+#     perm = np.random.permutation(len(inf_mats))
+#     inf_mats = [inf_mats[i] for i in perm]
+#     return inf_mats
+
+# def time_function(func, *args, **kwargs):
+#     start_time = time.time()
+#     result = func(*args, **kwargs)
+#     end_time = time.time()
+#     execution_time = end_time - start_time
+#     print(f"{func.__name__} execution time: {execution_time:.4f} seconds")
+#     return result, execution_time
+
+# def convert_numpy(obj):
+#     if isinstance(obj, np.ndarray):
+#         return obj.tolist()
+#     elif isinstance(obj, (np.float32, np.float64)):
+#         return float(obj)
+#     elif isinstance(obj, (np.int32, np.int64)):
+#         return int(obj)
+#     return obj
+
+# ###############################################################################
+# # Iterative Selection Procedure (for cardinality constraint only)
+# ###############################################################################
+# def iterative_selection(inf_mats, H0, num_poses, final_target):
+#     """
+#     Implements an iterative selection scheme:
+#       - Start with the full candidate set (all indices).
+#       - In the first iteration, set k_temp to 60% of the current candidate set size.
+#       - Solve the CVXPY problem (with constraint sum(x) <= k_temp) on the current candidate set,
+#         then perform randomized rounding.
+#       - Prune: remove candidates that are rounded to 0.
+#       - In subsequent iterations, set k_temp to 50% of the current candidate set size.
+#       - Repeat until the candidate set size is approximately 2 * final_target.
+    
+#     Parameters:
+#       inf_mats : list
+#          List of candidate FIM matrices.
+#       H0 : sparse matrix
+#          The prior matrix.
+#       num_poses : int
+#          Number of poses (passed to CVXPY optimization).
+#       final_target : int
+#          Final desired number of selections (e.g., 10% of original candidates).
+         
+#     Returns:
+#       candidate_set : list
+#          The final list of candidate indices.
+#       final_frac_solution : numpy array
+#          The final fractional solution on the reduced candidate set.
+#       final_binary_solution : numpy array
+#          The final binary solution (from randomized rounding) on the reduced candidate set.
+#     """
+#     candidate_set = list(range(len(inf_mats)))
+#     iteration = 0
+#     current_frac_solution = None
+
+#     while len(candidate_set) > 2 * final_target:
+#         current_size = len(candidate_set)
+#         if iteration == 0:
+#             k_temp = int(np.ceil(0.6 * current_size))
+#         else:
+#             k_temp = int(np.ceil(0.5 * current_size))
+#         print(f"Iteration {iteration}: Candidate set size = {current_size}, using k_temp = {k_temp}")
+        
+#         # Build the "at most k" constraint for the current candidate set:
+#         A_curr = csr_matrix(np.ones((1, current_size)))
+#         b_curr = np.array([k_temp])
+        
+#         # Current selection initialization.
+#         selection_init = np.ones(current_size, dtype=np.float16) / current_size
+        
+#         # Extract candidate FIMs.
+#         current_inf_mats = [inf_mats[i] for i in candidate_set]
+        
+#         # Solve CVXPY on the current candidate set.
+#         (frac_sol_current, obj_current), cvx_time_current = time_function(
+#             cvxpy_minimize_lse,
+#             inf_mats=current_inf_mats,
+#             H0=H0,
+#             selection_init=selection_init,
+#             num_poses=num_poses,
+#             A=A_curr,
+#             b=b_curr
+#         )
+#         print("Fractional solution for current candidate set:", frac_sol_current)
+        
+#         # Use randomized rounding on the current fractional solution.
+#         def obj_func(binary_vec):
+#             return evaluate_solution(current_inf_mats, H0, binary_vec)
+#         best_rand, rand_obj, feas_rate = multiple_randomized_rounds(
+#             frac_sol_current, A_curr, b_curr, obj_func, n_samples=500
+#         )
+#         print("Randomized rounding (current candidate set):", best_rand)
+        
+#         # Prune: keep only indices where the binary solution equals 1.
+#         new_candidate_set = [candidate_set[i] for i in range(len(best_rand)) if best_rand[i] == 1]
+#         print(f"Pruning: candidate set size reduced from {current_size} to {len(new_candidate_set)}")
+#         candidate_set = new_candidate_set
+#         current_frac_solution = frac_sol_current  # update last fractional solution (if needed)
+#         iteration += 1
+        
+#     # Final optimization on the reduced candidate set.
+#     current_size = len(candidate_set)
+#     print(f"Final candidate set size: {current_size}")
+#     A_final = csr_matrix(np.ones((1, current_size)))
+#     b_final = np.array([int(round(0.5 * current_size))])  # final constraint: ~50% of remaining
+#     selection_init = np.ones(current_size, dtype=np.float16) / current_size
+#     current_inf_mats = [inf_mats[i] for i in candidate_set]
+#     (final_frac_solution, final_obj), _ = time_function(
+#         cvxpy_minimize_lse,
+#         inf_mats=current_inf_mats,
+#         H0=H0,
+#         selection_init=selection_init,
+#         num_poses=num_poses,
+#         A=A_final,
+#         b=b_final
+#     )
+#     def final_obj_func(binary_vec):
+#         return evaluate_solution(current_inf_mats, H0, binary_vec)
+#     final_binary_solution, final_rand_obj, final_feas_rate = multiple_randomized_rounds(
+#         final_frac_solution, A_final, b_final, final_obj_func, n_samples=500
+#     )
+#     print("Final binary solution from iterative selection:", final_binary_solution)
+#     print("Final objective (iterative method):", evaluate_solution(current_inf_mats, H0, final_binary_solution))
+#     return candidate_set, final_frac_solution, final_binary_solution
+
+# ###############################################################################
+# # Run Iterative Selection, Full Candidate Rounding, and Compare
+# ###############################################################################
+# def run_budget_tests_iterative():
+#     """
+#     Implements the iterative selection scheme for a pure cardinality constraint.
+#     Final desired selection (final_target) is set to 10% of the original candidate set.
+    
+#     After obtaining the final solution from the iterative method, we also:
+#       - Compute a "global" fractional solution on the full candidate set with the original
+#         desired cardinality constraint.
+#       - Apply randomized rounding to the full candidate set fractional solution.
+#       - Compute the optimality gaps (percentage differences relative to the full fractional solution).
+    
+#     The final optimality gap for our iterative method is:
+#          Gap_iter (%) = 100 * (f_frac_full - f_iterative) / f_frac_full.
+#     Similarly, for the full candidate rounding we compute:
+#          Gap_full (%) = 100 * (f_frac_full - f_full_random) / f_frac_full.
+#     """
+#     # Configuration
+#     pose_dim = 6
+#     density = 0.1
+#     min_eigenvalue = 2
+#     num_matrices = 100  # Original candidate set size
+#     num_poses = 10
+
+#     # Final desired selection: 10% of original candidates.
+#     final_target = int(round(0.10 * num_matrices))
+#     print(f"Final target (K_final) = {final_target}")
+
+#     # Matrix size calculation.
+#     matrix_size = num_poses + num_poses * pose_dim
+
+#     # Generate candidate FIMs.
+#     inf_mats = generate_fim(num_matrices=num_matrices, matrix_size=matrix_size, 
+#                             generator_type="random", density=density, min_eigenvalue=min_eigenvalue, random_state=42)
+    
+#     # Create H0 as the prior matrix.
+#     H0 = diags([min_eigenvalue] * matrix_size, format='csr')
+
+#     # --- Run Iterative Selection ---
+#     final_candidate_set, final_frac_solution, final_binary_solution = iterative_selection(
+#         inf_mats, H0, num_poses, final_target
+#     )
+#     print("\nFinal selected candidate indices from iterative selection:", final_candidate_set)
+#     f_iterative = evaluate_solution([inf_mats[i] for i in final_candidate_set], H0, final_binary_solution)
+#     print("Final objective (iterative method):", f_iterative)
+
+#     # --- Global (Full Candidate Set) Fractional Solution ---
+#     A_orig = csr_matrix(np.ones((1, num_matrices)))
+#     b_orig = np.array([final_target])
+#     selection_init_full = np.ones(num_matrices, dtype=np.float16) / num_matrices
+#     (frac_solution_full, frac_obj_full), _ = time_function(
+#         cvxpy_minimize_lse,
+#         inf_mats=inf_mats,
+#         H0=H0,
+#         selection_init=selection_init_full,
+#         num_poses=num_poses,
+#         A=A_orig,
+#         b=b_orig
+#     )
+#     print("Fractional solution on full candidate set:", frac_solution_full)
+#     print("Fractional objective (full candidate set):", frac_obj_full)
+    
+#     # --- Global Randomized Rounding on Full Candidate Set ---
+#     def full_obj_func(binary_vec):
+#         return evaluate_solution(inf_mats, H0, binary_vec)
+#     full_random_solution, full_random_obj, full_feas_rate = multiple_randomized_rounds(
+#         frac_solution_full, A_orig, b_orig, full_obj_func, n_samples=500
+#     )
+#     print("Full candidate set randomized rounding solution:", full_random_solution)
+#     print("Full candidate set randomized rounding objective:", full_random_obj)
+#     print(f"Feasibility rate (full candidate set): {full_feas_rate*100:.2f}%")
+    
+#     # --- Compute Optimality Gaps ---
+#     gap_iter = 100 * (frac_obj_full - f_iterative) / frac_obj_full
+#     gap_full = 100 * (frac_obj_full - full_random_obj) / frac_obj_full
+#     print("\nFinal Optimality Gaps:")
+#     print(f"  Iterative Method Gap: {gap_iter:.2f}%")
+#     print(f"  Full Candidate Rounding Gap: {gap_full:.2f}%")
+    
+#     # --- Plot Comparison ---
+#     x_labels = ["Full Fractional"]
+#     x = np.arange(len(x_labels))
+#     width = 0.3
+
+#     fig, ax = plt.subplots(1, 2, figsize=(12,5))
+
+#     # Plot objectives.
+#     ax[0].bar(x - width/2, [frac_obj_full], width, label="Fractional (Full)", color='skyblue')
+#     ax[0].bar(x, [full_random_obj], width, label="Full Randomized", color='lightgreen')
+#     ax[0].bar(x + width/2, [f_iterative], width, label="Iterative Method", color='salmon')
+#     ax[0].set_ylabel("Objective Score")
+#     ax[0].set_title("Objective Scores (Full vs. Iterative)")
+#     ax[0].set_xticks(x)
+#     ax[0].set_xticklabels(x_labels)
+#     ax[0].legend()
+#     ax[0].grid(True, axis='y')
+
+#     # Plot gap percentages.
+#     ax[1].bar(x - width/2, [100 * (frac_obj_full - full_random_obj) / frac_obj_full], width,
+#               label="Full Randomized Gap (%)", color='lightgreen')
+#     ax[1].bar(x + width/2, [100 * (frac_obj_full - f_iterative) / frac_obj_full], width,
+#               label="Iterative Method Gap (%)", color='salmon')
+#     ax[1].set_ylabel("Gap (%)")
+#     ax[1].set_title("Optimality Gaps (Relative to Full Fractional)")
+#     ax[1].set_xticks(x)
+#     ax[1].set_xticklabels(x_labels)
+#     ax[1].legend()
+#     ax[1].grid(True, axis='y')
+
+#     plt.tight_layout()
+#     plt.show()
+    
+#     return final_candidate_set, final_frac_solution, final_binary_solution, gap_iter, gap_full
+
+# if __name__ == "__main__":
+#     run_budget_tests_iterative()
+
