@@ -55,8 +55,8 @@ def step_size_backtracking(
     beta: float = 0.5, 
     max_iters: int = 30,  # Increased from 20
     min_step_size: float = 1e-10,
-    inf_mats=None,  # Explicitly define these parameters
-    H0=None, 
+    # inf_mats=None,  # Explicitly define these parameters
+    # H0=None, 
     *args
 ) -> float:
     """
@@ -1141,10 +1141,12 @@ def greedy_01_selection(
     A: np.ndarray,
     b: np.ndarray,
     obj_func: Callable = min_eigenvalue_objective,
-    verbose: bool = False
-) -> Tuple[np.ndarray, float]:
+    verbose: bool = False,
+    timeout: Optional[float] = None
+) -> Tuple[np.ndarray, float, bool]:
     """
     Perform greedy 0/1 selection of matrices to maximize the objective function.
+    Forward selection only (no swapping phase).
     
     Args:
         inf_mats: List of information matrices to select from
@@ -1153,13 +1155,17 @@ def greedy_01_selection(
         b: Inequality constraint bounds
         obj_func: Objective function to maximize (default: min_eigenvalue_objective)
         verbose: Whether to print detailed output
+        timeout: Maximum execution time in seconds (None means no limit)
     
     Returns:
         Tuple containing:
         - Selected binary vector
         - Objective value
+        - Boolean indicating whether the algorithm timed out
     """
     n = len(inf_mats)
+    start_time = time.time()
+    timed_out = False
     
     # Initialize with empty selection
     current_selection = np.zeros(n, dtype=int)
@@ -1167,16 +1173,32 @@ def greedy_01_selection(
     
     if verbose:
         logger.info(f"Starting greedy selection with initial objective: {current_obj:.6f}")
+        if timeout is not None:
+            logger.info(f"Timeout set to {timeout:.1f} seconds")
     
     # Greedy forward selection
     improved = True
     while improved:
+        # Check timeout
+        if timeout is not None and (time.time() - start_time) > timeout:
+            if verbose:
+                logger.warning(f"Greedy selection timed out after {timeout:.1f} seconds")
+            timed_out = True
+            break
+            
         improved = False
         best_obj_delta = 0
         best_idx = -1
         
         # Try adding each unselected matrix
         for i in range(n):
+            # Check timeout within the inner loop as well
+            if timeout is not None and (time.time() - start_time) > timeout:
+                if verbose:
+                    logger.warning(f"Greedy selection timed out after {timeout:.1f} seconds")
+                timed_out = True
+                break
+                
             if current_selection[i] == 0:
                 # Try adding this matrix
                 test_selection = current_selection.copy()
@@ -1198,6 +1220,10 @@ def greedy_01_selection(
                         best_obj_delta = obj_delta
                         best_idx = i
         
+        # If timed out in inner loop, break
+        if timed_out:
+            break
+            
         # Update selection if improvement found
         if best_idx >= 0 and best_obj_delta > 0:
             current_selection[best_idx] = 1
@@ -1206,66 +1232,36 @@ def greedy_01_selection(
             
             if verbose:
                 logger.info(f"Added matrix {best_idx}, new objective: {current_obj:.6f}")
-    
-    # Try local improvements by swapping
-    swap_improved = True
-    while swap_improved:
-        swap_improved = False
-        best_swap_delta = 0
-        best_in = -1
-        best_out = -1
-        
-        # Consider all possible swaps
-        for i in range(n):
-            if current_selection[i] == 1:  # Candidate to remove
-                for j in range(n):
-                    if current_selection[j] == 0:  # Candidate to add
-                        # Try the swap
-                        test_selection = current_selection.copy()
-                        test_selection[i] = 0
-                        test_selection[j] = 1
-                        
-                        # Check if constraints are satisfied
-                        constraints_satisfied = True
-                        for k in range(A.shape[0]):
-                            if np.dot(A[k], test_selection) > b[k][0]:
-                                constraints_satisfied = False
-                                break
-                        
-                        if constraints_satisfied:
-                            # Evaluate objective with this swap
-                            test_obj = obj_func(test_selection, inf_mats, H0)
-                            obj_delta = test_obj - current_obj
-                            
-                            if obj_delta > best_swap_delta:
-                                best_swap_delta = obj_delta
-                                best_out = i
-                                best_in = j
-        
-        # Update selection if improvement found
-        if best_in >= 0 and best_out >= 0 and best_swap_delta > 0:
-            current_selection[best_out] = 0
-            current_selection[best_in] = 1
-            current_obj += best_swap_delta
-            swap_improved = True
-            
-            if verbose:
-                logger.info(f"Swapped out matrix {best_out} for matrix {best_in}, new objective: {current_obj:.6f}")
+                elapsed = time.time() - start_time
+                if timeout is not None:
+                    logger.info(f"Time elapsed: {elapsed:.1f}s / {timeout:.1f}s ({elapsed/timeout*100:.1f}%)")
     
     # Final objective verification
-    final_obj = obj_func(current_selection, inf_mats, H0)
+    if not timed_out:
+        final_obj = obj_func(current_selection, inf_mats, H0)
+    else:
+        final_obj = current_obj  # Use last computed objective if timed out
     
     if verbose:
         logger.info(f"Greedy selection complete. Final selection: {current_selection}")
         logger.info(f"Final objective value: {final_obj:.6f}")
+        if timed_out:
+            logger.warning("Note: Solution is incomplete due to timeout")
         
         # Check constraints satisfaction
         for i in range(A.shape[0]):
             constraint_value = np.dot(A[i], current_selection)
             constraint_limit = b[i][0]
             logger.info(f"Constraint {i}: {constraint_value:.4f} / {constraint_limit:.4f}")
+        
+        # Report total runtime
+        total_time = time.time() - start_time
+        logger.info(f"Total runtime: {total_time:.2f} seconds")
+        if timeout is not None:
+            logger.info(f"Timeout limit: {timeout:.2f} seconds")
+            logger.info(f"Used {total_time/timeout*100:.1f}% of available time")
     
-    return current_selection, final_obj
+    return current_selection, final_obj, timed_out
 
 # ======================================================================
 # Variance Information Calculation
