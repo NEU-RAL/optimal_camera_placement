@@ -88,11 +88,11 @@ def generate_random_test_problem(n: int, m: int, seed: int = 42) -> Tuple:
     # b_cardinality = np.array([cardinality])
     weights = np.random.uniform(1, 5, size=n)
     A_weight = weights.reshape(1, -1)
-    max_weight = round(0.08 * sum(weights))
+    max_weight = 50
     b_weight = np.array([max_weight])
     costs = np.random.uniform(10, 20, size=n)
     A_cost = costs.reshape(1, -1)
-    max_cost = round(0.05 * sum(costs))
+    max_cost = 150
     b_cost = np.array([max_cost])
     A_ineq = np.vstack([A_weight, A_cost])
     b_ineq = np.vstack([b_weight, b_cost])
@@ -908,9 +908,9 @@ def main():
     of n and m values, using multiple runs per configuration.
     """
     # Define experiment parameters
-    n_values = [100, 150, 500, 1000, 1500, 5000, 10000]  # Can increase for the actual paper
-    m_values = [100, 500, 1000, 1500, 5000, 10000]  # Can increase for the actual paper
-    num_runs_per_config = 1    # Use 5-10 runs per configuration for robust statistics
+    n_values = [100, 150, 500, 1000, 1500]  # Can increase for the actual paper
+    m_values = [100, 500, 1000, 1500]  # Can increase for the actual paper
+    num_runs_per_config = 5    # Use 5-10 runs per configuration for robust statistics
     base_seed = 42
     timeout_multiplier = 10
     
