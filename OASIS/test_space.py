@@ -8,6 +8,7 @@ import logging
 import time
 import warnings
 import networkx as nx
+import multiprocessing
 
 # Set up logging
 logging.basicConfig(
@@ -155,7 +156,7 @@ def compute_lipschitz_constant(
             combined_fim.tocsc() + 1e-10 * sp.eye(combined_fim.shape[0]), 
             k=min(num_eigs, combined_fim.shape[0]-1), 
             which='SA',
-            tol=1e-6  # Improved tolerance for eigenvalue calculation
+            tol=1e-4  # Improved tolerance for eigenvalue calculation
         )
         
         # Detect if there are clustered eigenvalues
@@ -463,7 +464,7 @@ def frank_wolfe_optimization(
     H0: sp.spmatrix,
     max_iterations: int = 1000,
     min_iterations: int = 3,  # Minimum number of iterations to perform
-    convergence_tol: float = 1e-4,
+    convergence_tol: float = 2e-2,
     step_size_strategy: StepSizeStrategy = StepSizeStrategy.BACKTRACKING,
     verbose: bool = False,
     check_final_stationarity: bool = True,
@@ -559,9 +560,9 @@ def frank_wolfe_optimization(
                 logger.info(f"Converged at iteration {iteration}: gradient norm minimized")
                 break
                 
-            if abs(obj_val - prev_obj_val) < convergence_tol * max(1.0, abs(obj_val)):
-                logger.info(f"Converged at iteration {iteration}: objective value stabilized")
-                break
+            # if abs(obj_val - prev_obj_val) < convergence_tol * max(1.0, abs(obj_val)):
+            #     logger.info(f"Converged at iteration {iteration}: objective value stabilized")
+            #     break
         
         prev_obj_val = obj_val
         
@@ -701,188 +702,91 @@ def min_eigenvalue_gradient(
     H0: sp.spmatrix
 ) -> np.ndarray:
     """
-    Compute the gradient of the minimum eigenvalue objective with enhanced numerical stability.
+    Compute the gradient of the minimum eigenvalue objective using caching 
+    and warm-starting for improved efficiency.
+    
+    This implementation pre-converts the information matrices to CSC,
+    caches the combined matrix (H0 + sum_i x_i * Hi) from the previous call,
+    and stores the last eigenvector as a warm start candidate for the fallback
+    eigenvalue solver.
     
     Args:
         x: Selection vector
-        inf_mats: List of information matrices
+        inf_mats: List of sparse information matrices
         H0: Prior information matrix
         
     Returns:
         np.ndarray: Gradient vector
     """
-    # Combine matrices with current selection
-    combined_fim = H0.copy()
-    for xi, Hi in zip(x, inf_mats):
-        combined_fim += xi * Hi
-    
-    # Enhanced regularization and convert to CSC format for eigsh
-    combined_fim = combined_fim.tocsc()
+    # Cache the CSC conversion of inf_mats once
+    if not hasattr(min_eigenvalue_gradient, "cached_inf_mats"):
+        min_eigenvalue_gradient.cached_inf_mats = [
+            Hi.tocsc() if not sp.isspmatrix_csc(Hi) else Hi for Hi in inf_mats
+        ]
+    cached_inf_mats = min_eigenvalue_gradient.cached_inf_mats
+
+    # Cache and update the combined matrix: H0 + sum_i x_i * Hi
+    if not hasattr(min_eigenvalue_gradient, "cached_x"):
+        # First call: compute full combined matrix
+        combined_fim = H0.copy().tocsc()
+        for i, xi in enumerate(x):
+            if abs(xi) > 1e-12:
+                combined_fim += xi * cached_inf_mats[i]
+        # Store cache for later calls
+        min_eigenvalue_gradient.cached_x = x.copy()
+        min_eigenvalue_gradient.cached_combined_fim = combined_fim
+    else:
+        # Compute the difference between current x and cached x
+        old_x = min_eigenvalue_gradient.cached_x
+        diff = x - old_x
+        # If the change is very small, reuse the previous combined matrix
+        if np.linalg.norm(diff) < 1e-12:
+            combined_fim = min_eigenvalue_gradient.cached_combined_fim
+        else:
+            # Incrementally update the combined matrix: new_combined = old + sum_i diff_i * Hi
+            combined_fim = min_eigenvalue_gradient.cached_combined_fim.copy()
+            for i, d in enumerate(diff):
+                if abs(d) > 1e-12:
+                    combined_fim += d * cached_inf_mats[i]
+            # Update cache with new x and combined matrix
+            min_eigenvalue_gradient.cached_x = x.copy()
+            min_eigenvalue_gradient.cached_combined_fim = combined_fim
+
     n = combined_fim.shape[0]
-    
+    # We request up to 2 eigenpairs to pick the minimum
+    k = min(2, n - 1) if n > 2 else 1
+
     try:
-        # Use ARPACK to compute eigenvalues/eigenvectors, requesting up to 5 smallest
-        k = min(5, n - 1)
-        eig_vals, eig_vecs = eigsh(
-            combined_fim, 
-            k=k, 
-            which='SA',
-            maxiter=2000,
-            tol=1e-6
-        )
-        min_eig_idx = np.argmin(eig_vals)
-        min_eig_vec = eig_vecs[:, min_eig_idx]
-        
-        # Compute the gradient components
-        grad = np.zeros(len(inf_mats))
-        for i, Hi in enumerate(inf_mats):
-            grad[i] = -float(min_eig_vec.T @ Hi.tocsc() @ min_eig_vec)
-        return grad
-    
-    except Exception as e:
-        logger.error(f"Gradient computation failed: {str(e)}. Using fallback method.")
-        
-        # Fallback: use numpy.linalg.eigh on a dense version of the matrix
-        try:
-            dense_fim = combined_fim.toarray()
-            eig_vals, eig_vecs = np.linalg.eigh(dense_fim)
+        # Primary eigenvalue computation using ARPACK via eigsh
+        eig_vals, eig_vecs = eigsh(combined_fim, k=k, which='SA', maxiter=1000, tol=1e-4)
+        if k == 1:
+            min_eig_vec = eig_vecs.flatten()
+        else:
             min_eig_idx = np.argmin(eig_vals)
             min_eig_vec = eig_vecs[:, min_eig_idx]
-            
-            grad = np.zeros(len(inf_mats))
-            for i, Hi in enumerate(inf_mats):
-                # Convert each Hi to dense
-                grad[i] = -float(min_eig_vec.T @ Hi.toarray() @ min_eig_vec)
-            return grad
+        # Save the eigenvector for potential warm-start in fallback
+        min_eigenvalue_gradient.last_eigvec = min_eig_vec
+    except Exception as e:
+        # Fallback: use LOBPCG with a warm start if available
+        from scipy.sparse.linalg import lobpcg
+        if hasattr(min_eigenvalue_gradient, "last_eigvec"):
+            v0 = min_eigenvalue_gradient.last_eigvec
+        else:
+            v0 = np.random.rand(n)
+            v0 = v0 / np.linalg.norm(v0)
+        X = np.zeros((n, 1))
+        X[:, 0] = v0
+        eig_vals, eig_vecs = lobpcg(combined_fim, X, largest=False, maxiter=500, tol=1e-6)
+        min_eig_vec = eig_vecs[:, 0]
+        min_eigenvalue_gradient.last_eigvec = min_eig_vec
+
+    # Compute the gradient: for each matrix Hi, the gradient is - v^T Hi v
+    grad = np.empty(len(cached_inf_mats))
+    for i, Hi in enumerate(cached_inf_mats):
+        temp = Hi.dot(min_eig_vec)
+        grad[i] = -float(min_eig_vec.dot(temp))
         
-        except Exception as fallback_error:
-            logger.error(f"Fallback gradient computation failed: {str(fallback_error)}. Returning zero gradient.")
-            return np.zeros(len(inf_mats))
-
-# ======================================================================
-# Example Usage
-# ======================================================================
-
-def generate_test_problem(
-    n: int = 1000, 
-    m: int = 1000, 
-    # cardinality: int = 3,
-    seed: int = 42
-) -> Tuple:
-    """
-    Generate a test problem for Frank-Wolfe optimization.
-    
-    Args:
-        n: Number of matrices to choose from
-        m: Size of each matrix
-        cardinality: Maximum number of matrices to select
-        seed: Random seed for reproducibility
-        
-    Returns:
-        Tuple: Problem parameters (matrices, constraints, etc.)
-    """
-    np.random.seed(seed)
-    
-    # Generate random sparse PSD matrices
-    inf_mats = []
-    for _ in range(n):
-        A = sp.rand(m, m, density=0.5, format="csc")
-        A = (A + A.T) / 2  # Symmetrize
-        A += m * sp.eye(m)  
-        inf_mats.append(A)
-    
-    # Generate initial prior matrix H0 (positive definite)
-    H0 = m * sp.eye(m)
-    cardinality = round(.1*n)
-    # Define constraints
-    # Cardinality Constraint: sum(x) <= cardinality
-    A_cardinality = np.ones((1, n))
-    b_cardinality = np.array([cardinality])
-    
-    # Total Weight Constraint: sum(w_i * x_i) <= max_weight
-    weights = np.random.uniform(1, 5, size=n)
-    A_weight = weights.reshape(1, -1)
-    max_weight = round(.1*sum(weights))
-    b_weight = np.array([max_weight])
-    
-    # Total Cost Constraint: sum(c_i * x_i) <= max_cost
-    costs = np.random.uniform(10, 20, size=n)
-    A_cost = costs.reshape(1, -1)
-    max_cost = round(.1*sum(costs))
-    b_cost = np.array([max_cost])
-    
-    # Stack all constraints together
-    A_ineq = np.vstack([A_cardinality, A_weight, A_cost])
-    b_ineq = np.vstack([b_cardinality, b_weight, b_cost])
-    
-    # Initial selection vector (randomly initialized)
-    selection_init = np.random.uniform(0, 1, size=n)
-    
-    return n, m, inf_mats, H0, A_ineq, b_ineq, selection_init, weights, costs
-
-def run_example(verbose=False):
-    """Run a simple example of Frank-Wolfe optimization.
-    
-    Args:
-        verbose: Whether to print detailed output
-    
-    Returns:
-        Tuple: Result vector, objective value, iterations, log
-    """
-    if verbose:
-        logger.info("Generating test problem...")
-    
-    n, m, inf_mats, H0, A_ineq, b_ineq, selection_init, weights, costs = generate_test_problem()
-    
-    if verbose:
-        logger.info("Problem setup:")
-        logger.info(f"  Number of matrices: {n}")
-        logger.info(f"  Matrix size: {m}x{m}")
-        logger.info(f"  Initial selection: {selection_init}")
-        logger.info("Running Frank-Wolfe optimization...")
-    
-    # Run the optimization
-    # For the main optimization function, make the stationarity check completely optional
-    result, obj_val, iters, log = frank_wolfe_optimization(
-        min_eigenvalue_objective,
-        min_eigenvalue_gradient,
-        selection_init,
-        A_ineq,
-        b_ineq,
-        inf_mats,
-        H0,
-        max_iterations=100,       # Set a reasonable number of iterations
-        min_iterations=3,        # Ensure at least this many iterations
-        step_size_strategy=StepSizeStrategy.DIMINISHING,
-        verbose=verbose,
-        check_final_stationarity=False  # Disable stationarity check by default
-    )
-    
-    # Print only the final summary - this will always be shown
-    print("\nFinal Results:")
-    print(f"Selection vector: {result}")
-    print(f"Objective value: {obj_val:.6f}")
-    print(f"Iterations performed: {iters}")
-    print(f"Final duality gap: {log['duality_gap'][-1]:.6e}")
-    print(f"Final gradient norm: {log['grad_norm'][-1]:.6e}")
-    
-    # Check constraints satisfaction
-    print("\nConstraints Check:")
-    for i in range(A_ineq.shape[0]):
-        constraint_value = A_ineq[i] @ result
-        constraint_limit = b_ineq[i][0]
-        print(f"Constraint {i}: {constraint_value:.4f} / {constraint_limit:.4f}")
-    
-    # For research purposes, show discretized solution
-    if np.any(np.logical_and(result > 0.1, result < 0.9)):
-        print("\nSuggested Discretized Solution:")
-        discrete_result = np.round(result)
-        print(f"Discrete selection: {discrete_result}")
-        discrete_obj = min_eigenvalue_objective(discrete_result, inf_mats, H0)
-        print(f"Discrete objective value: {discrete_obj:.6f}")
-    
-    return result, obj_val, iters, log
-
+    return grad
 
 # ======================================================================
 # Gurobi Branch and Cut Implementation
@@ -902,7 +806,7 @@ def branch_and_cut_gurobi(
     A: np.ndarray,
     b: np.ndarray,
     time_limit: int = 600,
-    mip_gap: float = 0.01,
+    mip_gap: float = 0.0,
     verbose: bool = False,
     cont_solution: np.ndarray = None
 ) -> Tuple[np.ndarray, float, Dict[str, Any]]:
@@ -939,7 +843,7 @@ def branch_and_cut_gurobi(
         
         with gp.Model("Matrix_Selection", env=env) as model:
             # Set parameters
-            model.setParam('TimeLimit', time_limit)
+            # model.setParam('TimeLimit', time_limit)
             model.setParam('MIPGap', mip_gap)
             model.setParam('LazyConstraints', 1)
             model.setParam('Cuts', 2)  # Aggressive cut generation
@@ -1140,128 +1044,189 @@ def greedy_01_selection(
     H0: sp.spmatrix,
     A: np.ndarray,
     b: np.ndarray,
-    obj_func: Callable = min_eigenvalue_objective,
+    obj_func: Callable = None,
     verbose: bool = False,
     timeout: Optional[float] = None
-) -> Tuple[np.ndarray, float, bool]:
+) -> Tuple[np.ndarray, float, Dict[str, Any]]:
     """
     Perform greedy 0/1 selection of matrices to maximize the objective function.
-    Forward selection only (no swapping phase).
+    Simplified implementation without parallel evaluation or early termination.
     
     Args:
         inf_mats: List of information matrices to select from
         H0: Prior information matrix
-        A: Inequality constraint matrix
+        A: Inequality constraint matrix 
         b: Inequality constraint bounds
-        obj_func: Objective function to maximize (default: min_eigenvalue_objective)
+        obj_func: Objective function to maximize (if None, uses min_eigenvalue_objective)
         verbose: Whether to print detailed output
         timeout: Maximum execution time in seconds (None means no limit)
-    
+        
     Returns:
         Tuple containing:
         - Selected binary vector
         - Objective value
-        - Boolean indicating whether the algorithm timed out
+        - Dictionary with statistics and status information
     """
+    if obj_func is None:
+        obj_func = min_eigenvalue_objective
+        
     n = len(inf_mats)
     start_time = time.time()
-    timed_out = False
+    
+    # Statistics collection
+    stats = {
+        "iterations": 0,
+        "obj_evaluations": 0,
+        "constraint_checks": 0,
+        "timed_out": False,
+        "runtime": 0.0,
+        "obj_history": []
+    }
     
     # Initialize with empty selection
     current_selection = np.zeros(n, dtype=int)
+    
+    # Precompute constraint values for empty selection
+    constraint_values = np.zeros(A.shape[0])
+    
+    # Compute initial objective
     current_obj = obj_func(current_selection, inf_mats, H0)
+    stats["obj_evaluations"] += 1
+    stats["obj_history"].append(current_obj)
     
     if verbose:
         logger.info(f"Starting greedy selection with initial objective: {current_obj:.6f}")
         if timeout is not None:
             logger.info(f"Timeout set to {timeout:.1f} seconds")
     
-    # Greedy forward selection
-    improved = True
-    while improved:
+    # Cache for matrix combinations and their effects
+    cached_objectives = {}
+    cached_constraints = {}
+    
+    # Precompute constraint impact of adding each matrix
+    constraint_impact = np.zeros((n, A.shape[0]))
+    for i in range(n):
+        constraint_impact[i] = A[:, i]
+    
+    # Set of eligible indices (matrices that can potentially be added)
+    eligible_indices = set(range(n))
+    
+    # Main greedy selection loop
+    while eligible_indices:
         # Check timeout
-        if timeout is not None and (time.time() - start_time) > timeout:
+        current_time = time.time()
+        if timeout is not None and (current_time - start_time) > timeout:
             if verbose:
-                logger.warning(f"Greedy selection timed out after {timeout:.1f} seconds")
-            timed_out = True
+                logger.warning(f"Greedy selection timed out after {current_time - start_time:.1f} seconds")
+            stats["timed_out"] = True
             break
             
-        improved = False
+        stats["iterations"] += 1
+        
+        # Collect candidate indices to evaluate
+        candidates = list(eligible_indices)
         best_obj_delta = 0
         best_idx = -1
         
-        # Try adding each unselected matrix
-        for i in range(n):
-            # Check timeout within the inner loop as well
-            if timeout is not None and (time.time() - start_time) > timeout:
-                if verbose:
-                    logger.warning(f"Greedy selection timed out after {timeout:.1f} seconds")
-                timed_out = True
-                break
-                
-            if current_selection[i] == 0:
-                # Try adding this matrix
-                test_selection = current_selection.copy()
-                test_selection[i] = 1
-                
-                # Check if constraints are satisfied
+        # Evaluate each candidate sequentially
+        for idx in candidates:
+            # Check if we've cached this evaluation
+            selection_key = tuple(np.where(current_selection == 1)[0]) + (idx,)
+            if selection_key in cached_objectives:
+                obj_delta = cached_objectives[selection_key] - current_obj
+            else:
+                # Check constraints
                 constraints_satisfied = True
                 for j in range(A.shape[0]):
-                    if np.dot(A[j], test_selection) > b[j][0]:
+                    new_constraint_value = constraint_values[j] + constraint_impact[idx][j]
+                    stats["constraint_checks"] += 1
+                    if new_constraint_value > b[j][0]:
                         constraints_satisfied = False
                         break
                 
-                if constraints_satisfied:
-                    # Evaluate objective with this matrix added
-                    test_obj = obj_func(test_selection, inf_mats, H0)
-                    obj_delta = test_obj - current_obj
-                    
-                    if obj_delta > best_obj_delta:
-                        best_obj_delta = obj_delta
-                        best_idx = i
-        
-        # If timed out in inner loop, break
-        if timed_out:
-            break
+                if not constraints_satisfied:
+                    # This candidate violates constraints - remove from eligible set
+                    eligible_indices.discard(idx)
+                    continue
+                
+                # Set single bit without copying the array
+                current_selection[idx] = 1
+                
+                # Evaluate objective with this matrix added
+                test_obj = obj_func(current_selection, inf_mats, H0)
+                stats["obj_evaluations"] += 1
+                
+                # Revert the change
+                current_selection[idx] = 0
+                
+                # Cache the result
+                cached_objectives[selection_key] = test_obj
+                obj_delta = test_obj - current_obj
             
-        # Update selection if improvement found
+            if obj_delta > best_obj_delta:
+                best_obj_delta = obj_delta
+                best_idx = idx
+        
+        # Check if we found an improvement
         if best_idx >= 0 and best_obj_delta > 0:
+            # Update selection
             current_selection[best_idx] = 1
+            eligible_indices.discard(best_idx)
+            
+            # Update objective and constraint values
             current_obj += best_obj_delta
-            improved = True
+            stats["obj_history"].append(current_obj)
+            
+            # Update constraint values incrementally
+            for j in range(A.shape[0]):
+                constraint_values[j] += constraint_impact[best_idx][j]
+                
+                # If this constraint is now tight, we can eliminate candidates that would violate it
+                if b[j][0] - constraint_values[j] < 1e-6:
+                    indices_to_remove = []
+                    for idx in eligible_indices:
+                        if constraint_impact[idx][j] > 0:
+                            indices_to_remove.append(idx)
+                    
+                    for idx in indices_to_remove:
+                        eligible_indices.discard(idx)
             
             if verbose:
                 logger.info(f"Added matrix {best_idx}, new objective: {current_obj:.6f}")
                 elapsed = time.time() - start_time
                 if timeout is not None:
                     logger.info(f"Time elapsed: {elapsed:.1f}s / {timeout:.1f}s ({elapsed/timeout*100:.1f}%)")
+        else:
+            # No improvement possible
+            break
     
-    # Final objective verification
-    if not timed_out:
-        final_obj = obj_func(current_selection, inf_mats, H0)
-    else:
-        final_obj = current_obj  # Use last computed objective if timed out
+    # Final statistics
+    stats["runtime"] = time.time() - start_time
+    stats["selected_count"] = np.sum(current_selection)
+    stats["final_constraints"] = constraint_values.tolist()
     
     if verbose:
         logger.info(f"Greedy selection complete. Final selection: {current_selection}")
-        logger.info(f"Final objective value: {final_obj:.6f}")
-        if timed_out:
+        logger.info(f"Final objective value: {current_obj:.6f}")
+        
+        if stats["timed_out"]:
             logger.warning("Note: Solution is incomplete due to timeout")
         
         # Check constraints satisfaction
         for i in range(A.shape[0]):
-            constraint_value = np.dot(A[i], current_selection)
-            constraint_limit = b[i][0]
-            logger.info(f"Constraint {i}: {constraint_value:.4f} / {constraint_limit:.4f}")
+            logger.info(f"Constraint {i}: {constraint_values[i]:.4f} / {b[i][0]:.4f}")
         
         # Report total runtime
-        total_time = time.time() - start_time
-        logger.info(f"Total runtime: {total_time:.2f} seconds")
+        logger.info(f"Total runtime: {stats['runtime']:.2f} seconds")
+        logger.info(f"Objective evaluations: {stats['obj_evaluations']}")
+        logger.info(f"Constraint checks: {stats['constraint_checks']}")
+        logger.info(f"Iterations: {stats['iterations']}")
+        
         if timeout is not None:
             logger.info(f"Timeout limit: {timeout:.2f} seconds")
-            logger.info(f"Used {total_time/timeout*100:.1f}% of available time")
+            logger.info(f"Used {stats['runtime']/timeout*100:.1f}% of available time")
     
-    return current_selection, final_obj, timed_out
+    return current_selection, current_obj, stats
 
 # ======================================================================
 # Variance Information Calculation
@@ -1321,7 +1286,7 @@ def round_solution(
     A: np.ndarray,
     b: np.ndarray,
     obj_func: Callable = min_eigenvalue_objective,
-    num_samples: int = 1000,
+    num_samples: int = 100,
     verbose: bool = False
 ) -> Tuple[np.ndarray, float]:
     """
@@ -1430,7 +1395,7 @@ def round_solution(
     return best_binary, best_obj
 
 # ======================================================================
-# Combined Approach: Run all methods and compare
+# Run all methods and compare
 # ======================================================================
 
 def solve_matrix_selection(
@@ -1459,7 +1424,7 @@ def solve_matrix_selection(
     
     # Generate initial point for Frank-Wolfe
     n = len(inf_mats)
-    selection_init = np.random.uniform(0, 1, size=n)
+    selection_init = np.zeros(n)
     
     # Method 1: Frank-Wolfe
     logger.info("Running Frank-Wolfe optimization...")
@@ -1503,7 +1468,7 @@ def solve_matrix_selection(
             A,
             b,
             obj_func=min_eigenvalue_objective,
-            num_samples=1000,
+            num_samples=100,
             verbose=verbose
         )
         
@@ -1513,7 +1478,7 @@ def solve_matrix_selection(
     # Method 2: Greedy 0/1 Selection
     logger.info("Running greedy 0/1 selection...")
     start_time = time.time()
-    greedy_x, greedy_obj = greedy_01_selection(
+    greedy_x, greedy_obj, greedy_stats = greedy_01_selection(
         inf_mats,
         H0,
         A,
@@ -1656,7 +1621,7 @@ def generate_test_problem_from_algorithm4(
         
         # Use a random offset to create different minimum eigenvalues
         # This ensures all matrices have different positive min eigenvalues
-        min_eig_offset = np.random.uniform(0.05, 1.0)  # Random value between 0.05 and 1.0
+        min_eig_offset = np.random.uniform(0.05, 5.0)  # Random value between 0.05 and 1.0
         
         A = L + min_eig_offset * sp.eye(m)
         
@@ -1668,7 +1633,7 @@ def generate_test_problem_from_algorithm4(
             logger.info(f"Generated {i+1}/{n} matrices")
     
     # Generate initial prior matrix H0 (identity matrix)
-    H0 = sp.eye(m)  # No need for +1 since we're not using the extended matrices approach
+    H0 = sp.eye(m) 
     
     # Define constraints - keep these the same as original
     # Cardinality Constraint: sum(x) <= cardinality
@@ -1678,13 +1643,13 @@ def generate_test_problem_from_algorithm4(
     # Total Weight Constraint: sum(w_i * x_i) <= max_weight
     weights = np.random.uniform(1, 5, size=n)
     A_weight = weights.reshape(1, -1)
-    max_weight = 0.3 * sum(weights)  # Allow selecting ~30% of total weight
+    max_weight = 25
     b_weight = np.array([max_weight])
     
     # Total Cost Constraint: sum(c_i * x_i) <= max_cost
     costs = np.random.uniform(10, 20, size=n)
     A_cost = costs.reshape(1, -1)
-    max_cost = 0.3 * sum(costs)  # Allow selecting ~30% of total cost
+    max_cost = 80
     b_cost = np.array([max_cost])
     
     # Stack all constraints together
@@ -1692,7 +1657,7 @@ def generate_test_problem_from_algorithm4(
     b_ineq = np.vstack([b_cardinality, b_weight, b_cost])
     
     # Initial selection vector (randomly initialized)
-    selection_init = np.random.uniform(0, 1, size=n)
+    selection_init = np.zeros(n)
     
     logger.info("Test problem generation complete.")
     
@@ -1823,4 +1788,4 @@ if __name__ == "__main__":
     # Run experiments with different eigenvalue gaps
     for gamma in [1.0]:
         print(f"\n\n===== EXPERIMENT WITH GAMMA = {gamma} =====")
-        run_algorithm4_example(verbose=True, n=50, m=20, gamma=gamma)
+        run_algorithm4_example(verbose=True, n=1000, m=100, gamma=gamma)

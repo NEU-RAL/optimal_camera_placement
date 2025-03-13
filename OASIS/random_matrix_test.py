@@ -41,6 +41,14 @@ class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
+        # Handle scalar NumPy types
+        elif isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32,
+                             np.int64, np.uint8, np.uint16, np.uint32, np.uint64)):
+            return int(obj)
+        elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, (np.bool_)):
+            return bool(obj)
         return super().default(obj)
 
 def generate_random_pd_matrices(n: int, m: int, density=0.3, min_eigen=0.1, max_eigen=1.0, seed=42) -> List[sp.spmatrix]:
@@ -96,7 +104,7 @@ def generate_random_test_problem(n: int, m: int, seed: int = 42) -> Tuple:
     b_cost = np.array([max_cost])
     A_ineq = np.vstack([A_weight, A_cost])
     b_ineq = np.vstack([b_weight, b_cost])
-    selection_init = np.random.uniform(0, 1, size=n)
+    selection_init = np.zeros(n)
     # Generate random locations (optional, for visualization)
     locations = np.random.uniform(0, 10, size=(n, 2))
     return n, m, inf_mats, H0, A_ineq, b_ineq, selection_init, weights, costs, locations
@@ -569,7 +577,7 @@ def plot_bar_charts_by_n_m(results_df: pd.DataFrame, save_dir: str = "figures"):
 def run_experiment_with_multiple_seeds(
     n: int, 
     m: int, 
-    num_runs: int = 5, 
+    num_runs: int = 2, 
     base_seed: int = 42,
     timeout_multiplier: int = 10
 ) -> Dict[str, Any]:
@@ -635,7 +643,7 @@ def run_experiment_with_multiple_seeds(
         greedy_timeout = fw_time * timeout_multiplier
         
         start_time = time.time()
-        greedy_result, greedy_obj, greedy_timed_out = test_space.greedy_01_selection(
+        greedy_result, greedy_obj, greedy_stats = test_space.greedy_01_selection(
             inf_mats,
             H0,
             A_ineq,
@@ -645,6 +653,9 @@ def run_experiment_with_multiple_seeds(
             timeout=None
         )
         greedy_time = time.time() - start_time
+        
+        # Extract timed_out flag from the stats dictionary
+        greedy_timed_out = greedy_stats.get("timed_out", False)
         
         # Method 3: Gurobi Branch-and-Cut (if available)
         if test_space.GUROBI_AVAILABLE:
@@ -679,7 +690,8 @@ def run_experiment_with_multiple_seeds(
                 "obj": greedy_obj,
                 "time": greedy_time,
                 "timed_out": greedy_timed_out,
-                "timeout_limit": greedy_timeout
+                "timeout_limit": greedy_timeout,
+                "stats": greedy_stats  # Store full stats for reference
             },
             "gurobi": {
                 "obj": gurobi_obj,
@@ -745,7 +757,7 @@ def run_experiment_with_multiple_seeds(
                                 for run in range(num_runs)]),
             "time_std": np.std([all_run_results[f"run_{run}"]["greedy"]["time"] 
                                for run in range(num_runs)]),
-            "timed_out_count": sum([all_run_results[f"run_{run}"]["greedy"]["timed_out"] 
+            "timed_out_count": sum([1 if all_run_results[f"run_{run}"]["greedy"]["timed_out"] else 0
                                   for run in range(num_runs)])
         }
     }
@@ -908,9 +920,9 @@ def main():
     of n and m values, using multiple runs per configuration.
     """
     # Define experiment parameters
-    n_values = [100, 150, 500, 1000, 1500]  # Can increase for the actual paper
-    m_values = [100, 500, 1000, 1500]  # Can increase for the actual paper
-    num_runs_per_config = 5    # Use 5-10 runs per configuration for robust statistics
+    n_values = [150]  # Can increase for the actual paper
+    m_values = [150]  # Can increase for the actual paper
+    num_runs_per_config = 2    # Use 5-10 runs per configuration for robust statistics
     base_seed = 42
     timeout_multiplier = 10
     
