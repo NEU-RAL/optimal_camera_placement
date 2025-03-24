@@ -2,13 +2,14 @@ from typing import List, Optional, Tuple, Dict, Any, Callable, Union
 import numpy as np
 import scipy.sparse as sp
 from scipy.optimize import linprog, line_search
-from scipy.sparse.linalg import eigsh
+from scipy.sparse.linalg import eigsh, lobpcg
 from enum import Enum
 import logging
 import time
 import warnings
 import networkx as nx
-import multiprocessing
+import json
+import statistics
 
 # Set up logging
 logging.basicConfig(
@@ -449,6 +450,20 @@ def check_stationarity(
         logger.error(f"Error in stationarity check: {str(e)}")
         return {"status": "ERROR", "value": None, "error": str(e)}
 
+def reset_min_eig_gradient_cache():
+    """
+    Clears the cached attributes in min_eigenvalue_gradient so that 
+    any dimension-specific caching won't collide with a new problem size.
+    """
+    cache_attrs = [
+        "cached_x",
+        "cached_combined_fim",
+        "cached_inf_mats",
+        "last_eigvec",
+    ]
+    for attr in cache_attrs:
+        if hasattr(min_eigenvalue_gradient, attr):
+            delattr(min_eigenvalue_gradient, attr)
 
 # ======================================================================
 # Main Frank-Wolfe Optimization
@@ -465,8 +480,8 @@ def frank_wolfe_optimization(
     max_iterations: int = 1000,
     min_iterations: int = 3,  # Minimum number of iterations to perform
     convergence_tol: float = 2e-2,
-    step_size_strategy: StepSizeStrategy = StepSizeStrategy.BACKTRACKING,
-    verbose: bool = False,
+    step_size_strategy: StepSizeStrategy = StepSizeStrategy.DIMINISHING,
+    verbose: bool = True,
     check_final_stationarity: bool = True,
     step_size_params: Dict[str, Any] = None
 ) -> Tuple[np.ndarray, float, int, Dict[str, List]]:
@@ -545,7 +560,7 @@ def frank_wolfe_optimization(
         
         # Save iteration data
         fw_log["iter"].append(iteration)
-        fw_log["x"].append(selection_cur.tolist())
+        # fw_log["x"].append(selection_cur.tolist())
         fw_log["obj_val"].append(obj_val)
         fw_log["duality_gap"].append(duality_gap)
         fw_log["grad_norm"].append(grad_norm)
@@ -689,7 +704,7 @@ def min_eigenvalue_objective(
     combined_fim += 1e-10 * sp.eye(combined_fim.shape[0])
     
     try:
-        min_eig_val, _ = eigsh(combined_fim.tocsc(), k=1, which='SA')
+        min_eig_val, _ = eigsh(combined_fim.tocsc(), k=1, which='SA', tol=1e-2, ncv = 40)
         return min_eig_val[0]
     except Exception as e:
         logger.error(f"Error computing eigenvalues: {str(e)}")
@@ -698,95 +713,115 @@ def min_eigenvalue_objective(
 
 def min_eigenvalue_gradient(
     x: np.ndarray, 
-    inf_mats: List[sp.spmatrix], 
-    H0: sp.spmatrix
+    inf_mats: list,         # List of sparse matrices
+    H0: sp.spmatrix,
+    skip_threshold: float = 1e-12,
+    lobpcg_tol: float = 1e-4,
+    lobpcg_maxiter: int = 200
 ) -> np.ndarray:
     """
-    Compute the gradient of the minimum eigenvalue objective using caching 
-    and warm-starting for improved efficiency.
+    Compute the gradient of the minimum eigenvalue objective 
+    (lambda_min of H0 + sum_i x_i * H_i), using:
     
-    This implementation pre-converts the information matrices to CSC,
-    caches the combined matrix (H0 + sum_i x_i * Hi) from the previous call,
-    and stores the last eigenvector as a warm start candidate for the fallback
-    eigenvalue solver.
-    
+    1) An incremental update for the combined FIM (cached).
+    2) LOBPCG every time (no ARPACK), with a warm start from the last eigenvector.
+    3) An optional skip if the new x is extremely close to the cached x.
+       (We just reuse the last eigenvector in that case, to avoid re-solving.)
+
     Args:
-        x: Selection vector
-        inf_mats: List of sparse information matrices
-        H0: Prior information matrix
-        
+        x : np.ndarray
+            Current selection vector (shape = (n,)).
+        inf_mats : list of sp.spmatrix
+            List of sparse information matrices H_i.
+        H0 : sp.spmatrix
+            Prior information matrix (same dimension as each H_i).
+        skip_threshold : float
+            If ||x - cached_x|| < skip_threshold, skip a new eigen solve 
+            and reuse the last eigenvector. Default 1e-12.
+        lobpcg_tol : float
+            Tolerance for lobpcg solver.
+        lobpcg_maxiter : int
+            Maximum iterations for lobpcg.
+
     Returns:
-        np.ndarray: Gradient vector
+        grad : np.ndarray
+            The gradient vector of size (n,), grad[i] = - (v^T H_i v).
     """
-    # Cache the CSC conversion of inf_mats once
+    
+    # --- 1) Cache the CSC conversion of inf_mats once ---
     if not hasattr(min_eigenvalue_gradient, "cached_inf_mats"):
         min_eigenvalue_gradient.cached_inf_mats = [
-            Hi.tocsc() if not sp.isspmatrix_csc(Hi) else Hi for Hi in inf_mats
+            Hi.tocsc() if not sp.isspmatrix_csc(Hi) else Hi
+            for Hi in inf_mats
         ]
     cached_inf_mats = min_eigenvalue_gradient.cached_inf_mats
-
-    # Cache and update the combined matrix: H0 + sum_i x_i * Hi
+    
+    # --- 2) Check if we have a cached x and combined FIM ---
     if not hasattr(min_eigenvalue_gradient, "cached_x"):
-        # First call: compute full combined matrix
+        # First call: build combined_fim from scratch
         combined_fim = H0.copy().tocsc()
         for i, xi in enumerate(x):
             if abs(xi) > 1e-12:
                 combined_fim += xi * cached_inf_mats[i]
-        # Store cache for later calls
+        
         min_eigenvalue_gradient.cached_x = x.copy()
         min_eigenvalue_gradient.cached_combined_fim = combined_fim
+        # No last eigenvector yet
+        min_eigenvalue_gradient.last_eigvec = None
+
+        # On the first call, we can define diff as something large (so we won't skip)
+        diff = x  # or e.g. np.ones_like(x)*9999
     else:
-        # Compute the difference between current x and cached x
+        # We have a cached FIM & x; do incremental update
         old_x = min_eigenvalue_gradient.cached_x
         diff = x - old_x
-        # If the change is very small, reuse the previous combined matrix
-        if np.linalg.norm(diff) < 1e-12:
-            combined_fim = min_eigenvalue_gradient.cached_combined_fim
-        else:
-            # Incrementally update the combined matrix: new_combined = old + sum_i diff_i * Hi
-            combined_fim = min_eigenvalue_gradient.cached_combined_fim.copy()
+        combined_fim = min_eigenvalue_gradient.cached_combined_fim
+
+        # If there's any nontrivial change, update the matrix
+        if np.linalg.norm(diff) > 1e-12:
+            combined_fim = combined_fim.copy()
             for i, d in enumerate(diff):
                 if abs(d) > 1e-12:
                     combined_fim += d * cached_inf_mats[i]
-            # Update cache with new x and combined matrix
             min_eigenvalue_gradient.cached_x = x.copy()
             min_eigenvalue_gradient.cached_combined_fim = combined_fim
-
-    n = combined_fim.shape[0]
-    # We request up to 2 eigenpairs to pick the minimum
-    k = min(2, n - 1) if n > 2 else 1
-
-    try:
-        # Primary eigenvalue computation using ARPACK via eigsh
-        eig_vals, eig_vecs = eigsh(combined_fim, k=k, which='SA', maxiter=1000, tol=1e-4)
-        if k == 1:
-            min_eig_vec = eig_vecs.flatten()
-        else:
-            min_eig_idx = np.argmin(eig_vals)
-            min_eig_vec = eig_vecs[:, min_eig_idx]
-        # Save the eigenvector for potential warm-start in fallback
-        min_eigenvalue_gradient.last_eigvec = min_eig_vec
-    except Exception as e:
-        # Fallback: use LOBPCG with a warm start if available
-        from scipy.sparse.linalg import lobpcg
-        if hasattr(min_eigenvalue_gradient, "last_eigvec"):
+    
+    # --- 3) Possibly skip a new eigen solve if the x-change is tiny ---
+    # (Only skip if we already have a last_eigvec)
+    if np.linalg.norm(diff) < skip_threshold and min_eigenvalue_gradient.last_eigvec is not None:
+        min_eig_vec = min_eigenvalue_gradient.last_eigvec
+    else:
+        # Solve for the smallest eigenvalue using LOBPCG with warm start
+        n = combined_fim.shape[0]
+        if min_eigenvalue_gradient.last_eigvec is not None:
             v0 = min_eigenvalue_gradient.last_eigvec
         else:
+            # First solve or no stored eigvec
             v0 = np.random.rand(n)
-            v0 = v0 / np.linalg.norm(v0)
-        X = np.zeros((n, 1))
-        X[:, 0] = v0
-        eig_vals, eig_vecs = lobpcg(combined_fim, X, largest=False, maxiter=500, tol=1e-6)
-        min_eig_vec = eig_vecs[:, 0]
+            v0 /= np.linalg.norm(v0)
+        
+        X = v0.reshape(-1, 1)
+        
+        eigvals, eigvecs = lobpcg(
+            combined_fim,
+            X,
+            largest=False,
+            tol=lobpcg_tol,
+            maxiter=lobpcg_maxiter
+        )
+        
+        min_eig_vec = eigvecs[:, 0]
         min_eigenvalue_gradient.last_eigvec = min_eig_vec
-
-    # Compute the gradient: for each matrix Hi, the gradient is - v^T Hi v
-    grad = np.empty(len(cached_inf_mats))
+    
+    # --- 4) Compute the gradient: grad[i] = - (v^T H_i v) ---
+    grad = np.empty(len(cached_inf_mats), dtype=float)
+    
     for i, Hi in enumerate(cached_inf_mats):
         temp = Hi.dot(min_eig_vec)
         grad[i] = -float(min_eig_vec.dot(temp))
-        
+    
     return grad
+
 
 # ======================================================================
 # Gurobi Branch and Cut Implementation
@@ -869,7 +904,7 @@ def branch_and_cut_gurobi(
                 logger.info("Adding initial cut from zero vector")
                 
             # Compute eigenvalue and eigenvector for the base matrix H0
-            min_eig_val0, min_eig_vec0 = eigsh(H0.tocsc(), k=1, which='SA')
+            min_eig_val0, min_eig_vec0 = eigsh(H0.tocsc(), k=1, tol=1e-3, which='SA')
             min_eig_val0 = min_eig_val0[0]
             
             # Compute the gradient at this point
@@ -893,7 +928,7 @@ def branch_and_cut_gurobi(
                 for j in range(n):
                     combined_fim_cont += cont_solution[j] * inf_mats[j]
                 
-                min_eig_val_cont, min_eig_vec_cont = eigsh(combined_fim_cont.tocsc(), k=1, which='SA')
+                min_eig_val_cont, min_eig_vec_cont = eigsh(combined_fim_cont.tocsc(), k=1, tol=1e-3, which='SA')
                 cont_obj_val = min_eig_val_cont[0]
                 
                 # Set an upper bound for t based on this value
@@ -926,7 +961,7 @@ def branch_and_cut_gurobi(
                             combined_fim += inf_mats[j]
                     
                     # Calculate minimum eigenvalue and eigenvector
-                    min_eig_val, min_eig_vec = eigsh(combined_fim.tocsc(), k=1, which='SA')
+                    min_eig_val, min_eig_vec = eigsh(combined_fim.tocsc(), k=1, tol=1e-3,which='SA')
                     actual_min_eig = min_eig_val[0]
                     
                     # If the current t is greater than the actual eigenvalue (with some tolerance),
@@ -970,7 +1005,7 @@ def branch_and_cut_gurobi(
                         combined_fim += x_vals[j] * inf_mats[j]
                     
                     # Calculate minimum eigenvalue and eigenvector
-                    min_eig_val, min_eig_vec = eigsh(combined_fim.tocsc(), k=1, which='SA')
+                    min_eig_val, min_eig_vec = eigsh(combined_fim.tocsc(), k=1, tol=1e-3, which='SA')
                     actual_min_eig = min_eig_val[0]
                     
                     # Check if we need to add a cut
@@ -1012,7 +1047,7 @@ def branch_and_cut_gurobi(
                     if x_solution[j] > 0.5:
                         combined_fim += inf_mats[j]
                 
-                min_eig_val, _ = eigsh(combined_fim.tocsc(), k=1, which='SA')
+                min_eig_val, _ = eigsh(combined_fim.tocsc(), k=1, tol=1e-3, which='SA', ncv=40)
                 obj_val = min_eig_val[0]
                 
                 # Collect solution statistics
@@ -1232,48 +1267,53 @@ def greedy_01_selection(
 # Variance Information Calculation
 # ======================================================================
 
-def compute_variance_info(A, x_star):
+def compute_variance_info(A: np.ndarray, x_star: np.ndarray):
     """
-    For each row i of A (i.e. for each constraint), compute and print:
-    
-    - Expectation: E[s_i] = a_i^T x_star,
-    - Variance: Var(s_i) = sum_j (a_ij^2 * x_star[j] * (1 - x_star[j])),
-    - Ratio: sqrt(Var(s_i)) / E[s_i]
-    
+    For each row i of A:
+      - Print:
+          E[s_i], Var(s_i), ratio = sqrt(Var) / E
+      - Collect the same info into a list of dicts for JSON.
+
     Parameters
     ----------
-    A : numpy.ndarray, shape (p, m)
-        The constraint matrix (each row represents the coefficients for one constraint).
-    x_star : numpy.ndarray, shape (m,)
-        The fractional solution (with entries in [0, 1]).
-    
+    A : np.ndarray, shape (p, m)
+        The constraint matrix (each row = one constraint).
+    x_star : np.ndarray, shape (m,)
+        The solution vector (entries in [0,1]).
+
     Returns
     -------
-    info : list of tuples
-        A list where each element is a tuple (E, Var, ratio) for one row of A.
+    A list of dictionaries, each like {"E": ..., "Var": ..., "ratio": ...},
+    which is suitable for JSON serialization.
     """
     p, m = A.shape
-    info = []
-    
+    variance_info_list = []
+
     for i in range(p):
-        a_i = A[i, :]          
-        E = np.dot(a_i, x_star) 
-        Var = np.sum((a_i**2) * x_star * (1 - x_star))  # Variance of s_i
+        a_i = A[i, :]
+        E = np.dot(a_i, x_star)
+        Var = np.sum((a_i**2) * x_star * (1 - x_star))
         
         if E > 1e-12:
             ratio = np.sqrt(Var) / E
         else:
-            ratio = np.inf  # If the expectation is nearly 0, the ratio is undefined
+            ratio = np.inf
         
-        # Print the values for this constraint row.
+        # -- Print to console (same as original) --
         print(f"Constraint row {i}:")
         print(f"  Expectation E[s_{i}] = {E:.4f}")
         print(f"  Variance Var(s_{i})  = {Var:.4f}")
         print(f"  Ratio sqrt(Var)/E    = {ratio:.4f}")
         
-        info.append((E, Var, ratio))
-    
-    return info
+        # -- Also store in JSON-friendly dict --
+        variance_info_list.append({
+            "E": float(E),
+            "Var": float(Var),
+            "ratio": float(ratio)
+        })
+
+    return variance_info_list
+
 
 # ======================================================================
 # Rounding Function for Converting Continuous to Binary
@@ -1440,7 +1480,7 @@ def solve_matrix_selection(
         max_iterations=1000,
         min_iterations=3,
         step_size_strategy=StepSizeStrategy.DIMINISHING,
-        verbose=verbose,
+        verbose=True,
         check_final_stationarity=False
     )
     fw_time = time.time() - start_time
@@ -1475,24 +1515,24 @@ def solve_matrix_selection(
         results["frank_wolfe"]["x_binary"] = fw_binary_x
         results["frank_wolfe"]["obj_binary"] = fw_binary_obj
     
-    # Method 2: Greedy 0/1 Selection
-    logger.info("Running greedy 0/1 selection...")
-    start_time = time.time()
-    greedy_x, greedy_obj, greedy_stats = greedy_01_selection(
-        inf_mats,
-        H0,
-        A,
-        b,
-        obj_func=min_eigenvalue_objective,
-        verbose=verbose
-    )
-    greedy_time = time.time() - start_time
+    # # Method 2: Greedy 0/1 Selection
+    # logger.info("Running greedy 0/1 selection...")
+    # start_time = time.time()
+    # greedy_x, greedy_obj, greedy_stats = greedy_01_selection(
+    #     inf_mats,
+    #     H0,
+    #     A,
+    #     b,
+    #     obj_func=min_eigenvalue_objective,
+    #     verbose=verbose
+    # )
+    # greedy_time = time.time() - start_time
     
-    results["greedy"] = {
-        "x": greedy_x,
-        "obj": greedy_obj,
-        "time": greedy_time
-    }
+    # results["greedy"] = {
+    #     "x": greedy_x,
+    #     "obj": greedy_obj,
+    #     "time": greedy_time
+    # }
     
     # Method 4: Gurobi Branch and Cut
     logger.info("Running Gurobi branch and cut...")
@@ -1621,7 +1661,7 @@ def generate_test_problem_from_algorithm4(
         
         # Use a random offset to create different minimum eigenvalues
         # This ensures all matrices have different positive min eigenvalues
-        min_eig_offset = np.random.uniform(0.05, 5.0)  # Random value between 0.05 and 1.0
+        min_eig_offset = np.random.uniform(1, 50)  # Random value between 0.05 and 1.0
         
         A = L + min_eig_offset * sp.eye(m)
         
@@ -1637,24 +1677,24 @@ def generate_test_problem_from_algorithm4(
     
     # Define constraints - keep these the same as original
     # Cardinality Constraint: sum(x) <= cardinality
-    A_cardinality = np.ones((1, n))
-    b_cardinality = np.array([cardinality])
+    # A_cardinality = np.ones((1, n))
+    # b_cardinality = np.array([cardinality])
     
     # Total Weight Constraint: sum(w_i * x_i) <= max_weight
     weights = np.random.uniform(1, 5, size=n)
     A_weight = weights.reshape(1, -1)
-    max_weight = 25
+    max_weight = round(0.1*sum(weights))
     b_weight = np.array([max_weight])
     
     # Total Cost Constraint: sum(c_i * x_i) <= max_cost
     costs = np.random.uniform(10, 20, size=n)
     A_cost = costs.reshape(1, -1)
-    max_cost = 80
+    max_cost = round(0.1*sum(weights))
     b_cost = np.array([max_cost])
     
     # Stack all constraints together
-    A_ineq = np.vstack([A_cardinality, A_weight, A_cost])
-    b_ineq = np.vstack([b_cardinality, b_weight, b_cost])
+    A_ineq = np.vstack([A_weight, A_cost])
+    b_ineq = np.vstack([b_weight, b_cost])
     
     # Initial selection vector (randomly initialized)
     selection_init = np.zeros(n)
@@ -1777,15 +1817,333 @@ def run_algorithm4_example(verbose=True, n=100, m=10, gamma=0.01):
     # Return the results
     return results
 
-# Example usage:
-if __name__ == "__main__":
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+def run_single_experiment(
+    n: int, 
+    m: int, 
+    seed: int, 
+    time_limit: Optional[float] = None, 
+    verbose: bool = False
+) -> Dict[str, Any]:
+    """
+    Runs one single 'experiment' for the pair (n, m),
+    storing selection vectors and variance info for each method.
+    """
+    np.random.seed(seed)
+    
+    # -- 1) Generate problem --
+    _, _, inf_mats, H0, A_ineq, b_ineq, selection_init, _, _ = generate_test_problem_from_algorithm4(
+        n=n, 
+        m=m, 
+        cardinality=int(0.1 * n), 
+        seed=seed
     )
     
-    # Run experiments with different eigenvalue gaps
-    for gamma in [1.0]:
-        print(f"\n\n===== EXPERIMENT WITH GAMMA = {gamma} =====")
-        run_algorithm4_example(verbose=True, n=1000, m=100, gamma=gamma)
+    reset_min_eig_gradient_cache()
+    # -- 2) Continuous Frank–Wolfe --
+    start_fw = time.time()
+    fw_x, fw_obj, fw_iters, fw_log = frank_wolfe_optimization(
+        obj_func=min_eigenvalue_objective,
+        obj_grad=min_eigenvalue_gradient,
+        selection_init=selection_init,
+        A=A_ineq,
+        b=b_ineq,
+        inf_mats=inf_mats,
+        H0=H0,
+        max_iterations=1000,
+        min_iterations=3,
+        convergence_tol=2e-2,
+        verbose=verbose,
+        check_final_stationarity=False
+    )
+    end_fw = time.time()
+    
+    # Compute & print variance info, store as JSON
+    fw_variance_info = compute_variance_info(A_ineq, fw_x)
+    
+    continuous_results = {
+        "obj": float(fw_obj),
+        "time": end_fw - start_fw,
+        "iterations": fw_iters,
+        # "selection": fw_x.tolist(),
+        "variance_info": fw_variance_info  # store the list of dicts
+    }
+    
+    # -- 3) Randomized Rounding --
+    start_rr = time.time()
+    rr_x, rr_obj = round_solution(
+        cont_sol=fw_x,
+        inf_mats=inf_mats,
+        H0=H0,
+        A=A_ineq,
+        b=b_ineq,
+        obj_func=min_eigenvalue_objective,
+        num_samples=100,
+        verbose=verbose
+    )
+    end_rr = time.time()
+    
+    rr_variance_info = compute_variance_info(A_ineq, rr_x)
+    
+    rounding_results = {
+        "obj": float(rr_obj),
+        "time": end_rr - start_rr,
+        # "selection": rr_x.tolist(),
+        "variance_info": rr_variance_info
+    }
+    
+    # -- 4) Gurobi Branch & Cut --
+    start_bc = time.time()
+    gurobi_x, gurobi_obj, gurobi_stats = branch_and_cut_gurobi(
+        inf_mats=inf_mats,
+        H0=H0,
+        A=A_ineq,
+        b=b_ineq,
+        time_limit=time_limit,
+        verbose=True,
+        cont_solution=None
+    )
+    end_bc = time.time()
+    
+    if gurobi_x is None:
+        gurobi_results = {
+            "obj": float('-inf'),
+            "time": end_bc - start_bc,
+            "stats": {"status": "GUROBI_FAILED_OR_UNAVAILABLE"},
+            "selection": [],
+            "variance_info": []
+        }
+    else:
+        gurobi_variance_info = compute_variance_info(A_ineq, gurobi_x)
+        
+        # Convert stats
+        gurobi_stats_serial = {
+            k: float(v) if isinstance(v, (int, float, np.float64)) else v
+            for k, v in gurobi_stats.items()
+        }
+        gurobi_results = {
+            "obj": float(gurobi_obj),
+            "time": end_bc - start_bc,
+            "stats": gurobi_stats_serial,
+            # "selection": gurobi_x.tolist(),
+            "variance_info": gurobi_variance_info
+        }
+    
+    # -- 5) Compile results for JSON --
+    run_dict = {
+        "continuous_relaxation": continuous_results,
+        "randomized_rounding": rounding_results,
+        "gurobi": gurobi_results
+    }
+    
+    return run_dict
+
+def aggregate_stats(runs_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Given a list of run dictionaries (each one has
+       "continuous_relaxation" -> {"obj":..., "time":..., "iterations":...}
+       "randomized_rounding"   -> {"obj":..., "time":...}
+       "gurobi"                -> {"obj":..., "time":..., "stats":...}
+    ), compute aggregated statistics: mean, std, min, max for "obj" and mean, std for "time".
+    
+    Returns a dict with the "stats" block you requested.
+    """
+    continuous_objs = []
+    continuous_times = []
+    continuous_iters = []
+    
+    rounding_objs = []
+    rounding_times = []
+    
+    gurobi_objs = []
+    gurobi_times = []
+    
+    # Populate
+    for run_dict in runs_data:
+        # Continuous
+        c_rel = run_dict["continuous_relaxation"]
+        continuous_objs.append(c_rel["obj"])
+        continuous_times.append(c_rel["time"])
+        continuous_iters.append(c_rel["iterations"])
+        
+        # Randomized rounding
+        rr = run_dict["randomized_rounding"]
+        rounding_objs.append(rr["obj"])
+        rounding_times.append(rr["time"])
+        
+        # Gurobi
+        grb = run_dict["gurobi"]
+        gurobi_objs.append(grb["obj"])
+        gurobi_times.append(grb["time"])
+    
+    def stats_1d(values):
+        d = {}
+        arr = [float(v) for v in values]
+        d["mean"] = float(np.mean(arr))
+        d["std"] = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+        d["min"] = float(np.min(arr))
+        d["max"] = float(np.max(arr))
+        return d
+    
+    # Build stats block
+    stats_block = {
+        "num_runs": len(runs_data),
+        
+        "continuous_relaxation": {
+            "obj_mean": stats_1d(continuous_objs)["mean"],
+            "obj_std":  stats_1d(continuous_objs)["std"],
+            "obj_min":  stats_1d(continuous_objs)["min"],
+            "obj_max":  stats_1d(continuous_objs)["max"],
+            "time_mean": stats_1d(continuous_times)["mean"],
+            "time_std":  stats_1d(continuous_times)["std"],
+            # optionally store iteration stats as well
+            "iterations_mean": stats_1d(continuous_iters)["mean"],
+            "iterations_std":  stats_1d(continuous_iters)["std"],
+        },
+        
+        "randomized_rounding": {
+            "obj_mean": stats_1d(rounding_objs)["mean"],
+            "obj_std":  stats_1d(rounding_objs)["std"],
+            "obj_min":  stats_1d(rounding_objs)["min"],
+            "obj_max":  stats_1d(rounding_objs)["max"],
+            "time_mean": stats_1d(rounding_times)["mean"],
+            "time_std":  stats_1d(rounding_times)["std"]
+        },
+        
+        "gurobi": {
+            "obj_mean": stats_1d(gurobi_objs)["mean"],
+            "obj_std":  stats_1d(gurobi_objs)["std"],
+            "obj_min":  stats_1d(gurobi_objs)["min"],
+            "obj_max":  stats_1d(gurobi_objs)["max"],
+            "time_mean": stats_1d(gurobi_times)["mean"],
+            "time_std":  stats_1d(gurobi_times)["std"]
+        }
+    }
+    
+    return stats_block
+
+
+
+def run_experiments_for_n_m_pairs(
+    n_values: List[int],
+    m_values: List[int],
+    num_runs: int = 5,
+    time_limit: Optional[float] = None,
+    verbose: bool = False
+):
+    """
+    For each (n, m) in the Cartesian product of n_values x m_values,
+    1) create a separate JSON file named f"results_n{n}_m{m}.json"
+    2) do 'num_runs' runs
+    3) aggregate stats
+    4) write final JSON with structure:
+        {
+          "runs": { "run_0": {...}, "run_1": {...}, ... },
+          "stats": {
+              "n": n,
+              "m": m,
+              "num_runs": num_runs,
+              "continuous_relaxation": {...},
+              "randomized_rounding":   {...},
+              "gurobi":                {...}
+          }
+        }
+    5) Finally, print a summary table for all pairs.
+    """
+    
+    summary_results = [] 
+    for n in n_values:
+        for m in m_values:
+            runs_data = []
+            
+            # We might vary the seed each run, e.g., 0..4
+            for run_idx in range(num_runs):
+                seed = 1000 * (run_idx + 1)  # or any seed you like
+                print(f"\n=== (n={n}, m={m}) - Run {run_idx} with seed={seed} ===")
+                
+                run_result = run_single_experiment(
+                    n=n,
+                    m=m,
+                    seed=seed,
+                    time_limit=time_limit,
+                    verbose=verbose
+                )
+                runs_data.append(run_result)
+            
+            # Aggregate stats
+            stats_block = aggregate_stats(runs_data)
+            
+            # Build final dictionary for JSON
+            runs_out = {}
+            for i, rd in enumerate(runs_data):
+                runs_out[f"run_{i}"] = rd
+            
+            output_dict = {
+                "runs": runs_out,
+                "stats": {
+                    "n": n,
+                    "m": m,
+                    **stats_block  # merges the aggregated stats
+                }
+            }
+            
+            # Write to JSON file
+            filename = f"results_n{n}_m{m}.json"
+            with open(filename, "w") as f:
+                json.dump(output_dict, f, indent=2)
+            
+            print(f"Saved results for (n={n}, m={m}) to {filename}")
+            
+            # For summary table, just pick out a few items (e.g. mean objective/time)
+            summary_results.append({
+                "n": n,
+                "m": m,
+                # continuous relaxation
+                "FW_obj_mean": stats_block["continuous_relaxation"]["obj_mean"],
+                "FW_time_mean": stats_block["continuous_relaxation"]["time_mean"],
+                # randomized rounding
+                "RR_obj_mean": stats_block["randomized_rounding"]["obj_mean"],
+                "RR_time_mean": stats_block["randomized_rounding"]["time_mean"],
+                # gurobi
+                "GRB_obj_mean": stats_block["gurobi"]["obj_mean"],
+                "GRB_time_mean": stats_block["gurobi"]["time_mean"],
+            })
+    
+    # --- Print summary table for all (n,m) pairs ---
+    print("\n\nFINAL SUMMARY TABLE")
+    print("-------------------------------------------------------------------------------------------")
+    header = (
+        f"{'n':>6}  {'m':>6}  |"
+        f"{'FW_obj_mean':>12}  {'FW_time_mean':>12}  |"
+        f"{'RR_obj_mean':>12}  {'RR_time_mean':>12}  |"
+        f"{'GRB_obj_mean':>12}  {'GRB_time_mean':>12}"
+    )
+    print(header)
+    print("-------------------------------------------------------------------------------------------")
+    for row in summary_results:
+        print(
+            f"{row['n']:6d}  {row['m']:6d}  |"
+            f"{row['FW_obj_mean']:12.4f}  {row['FW_time_mean']:12.2f}  |"
+            f"{row['RR_obj_mean']:12.4f}  {row['RR_time_mean']:12.2f}  |"
+            f"{row['GRB_obj_mean']:12.4f}  {row['GRB_time_mean']:12.2f}"
+        )
+    print("-------------------------------------------------------------------------------------------")
+
+
+
+def main():
+    logging.basicConfig(level=logging.INFO)
+
+    n_values = [500, 1000, 1500, 3000, 5000, 10000]   
+    m_values = [500, 1000, 1500, 3000, 5000, 10000]
+    
+    run_experiments_for_n_m_pairs(
+        n_values=n_values,
+        m_values=m_values,
+        num_runs=1,
+        time_limit=None,   # pass a time limit if desired, e.g. 600 for 10 minutes
+        verbose=False
+    )
+
+
+if __name__ == "__main__":
+    main()
