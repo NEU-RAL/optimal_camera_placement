@@ -478,7 +478,7 @@ def frank_wolfe_optimization(
     inf_mats: List[sp.spmatrix],
     H0: sp.spmatrix,
     max_iterations: int = 1000,
-    min_iterations: int = 3,  # Minimum number of iterations to perform
+    min_iterations: int = 2,  # Minimum number of iterations to perform
     convergence_tol: float = 2e-2,
     step_size_strategy: StepSizeStrategy = StepSizeStrategy.DIMINISHING,
     verbose: bool = True,
@@ -1263,6 +1263,166 @@ def greedy_01_selection(
     
     return current_selection, current_obj, stats
 
+def greedy_algorithm_2(
+    ground_set: List[int],
+    f: Callable[[List[int]], float],
+    A: np.ndarray,
+    b: np.ndarray,
+    verbose: bool = False,
+    timeout: Optional[float] = None
+) -> Tuple[List[int], float, Dict[str, Any]]:
+    """
+    Implementation of Algorithm 2 from the paper "Maximization of nonsubmodular functions 
+    under multiple constraints with applications" (Ye et al., 2023).
+    
+    This algorithm greedily maximizes a monotone nondecreasing set function f(A) 
+    subject to multiple linear constraints of the form A·x ≤ b.
+    
+    Args:
+        ground_set: List of indices representing the ground set S
+        f: Objective function to maximize (takes a list of selected elements)
+        A: Constraint matrix where each row represents a constraint
+        b: Constraint bounds vector
+        verbose: Whether to print progress information
+        timeout: Maximum execution time in seconds (None means no limit)
+        
+    Returns:
+        Tuple containing:
+        - Selected elements (subset of ground_set)
+        - Objective value f(A_g)
+        - Dictionary with statistics and status information
+    """
+    start_time = time.time()
+    n = len(ground_set)  # Number of elements in ground set
+    m = A.shape[0]       # Number of constraints
+    
+    # Statistics collection
+    stats = {
+        "iterations": 0,
+        "obj_evaluations": 0,
+        "timed_out": False,
+        "runtime": 0.0,
+        "obj_history": []
+    }
+    
+    # Initialize with empty selection
+    A_g = []    # Current greedy solution
+    W = ground_set.copy()  # Set of elements not yet considered
+    
+    # Compute initial objective value
+    current_obj = f(A_g)
+    stats["obj_evaluations"] += 1
+    stats["obj_history"].append(current_obj)
+    
+    # Track constraint values
+    constraint_values = np.zeros(m)
+    
+    # Precompute constraint impact for each element
+    constraint_impact = A  # Each A[i,j] represents impact of element j on constraint i
+    
+    if verbose:
+        print(f"Starting greedy selection with initial objective: {current_obj:.6f}")
+    
+    # Define the feasible set based on constraints
+    def is_feasible(new_element):
+        """Check if adding new_element to A_g satisfies all constraints"""
+        for i in range(m):
+            new_constraint_value = constraint_values[i] + constraint_impact[i, new_element]
+            if new_constraint_value > b[i]:
+                return False
+        return True
+    
+    # Main greedy selection loop
+    while W:
+        # Check timeout
+        if timeout is not None and (time.time() - start_time) > timeout:
+            stats["timed_out"] = True
+            if verbose:
+                print(f"Greedy selection timed out after {time.time() - start_time:.1f} seconds")
+            break
+            
+        stats["iterations"] += 1
+        
+        # Find the best element and constraint pair
+        best_ratio = -float('inf')
+        best_element = None
+        best_i = None
+        
+        for v in W:
+            # Calculate marginal gain in objective function
+            A_g_plus_v = A_g + [v]
+            new_obj = f(A_g_plus_v)
+            stats["obj_evaluations"] += 1
+            delta_f = new_obj - current_obj
+            
+            # Skip if no improvement in objective
+            if delta_f <= 0:
+                continue
+                
+            # Find the best ratio across all constraints where delta_h_i > 0
+            for i in range(m):
+                delta_h_i = constraint_impact[i, v]
+                
+                # Skip if element has no impact on this constraint
+                if delta_h_i <= 0:
+                    continue
+                
+                # Calculate ratio: marginal gain / marginal cost
+                ratio = delta_f / delta_h_i
+                
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_element = v
+                    best_i = i
+        
+        # If no improvement found, exit
+        if best_element is None:
+            break
+        
+        # Check if adding best_element violates any constraint
+        if is_feasible(best_element):
+            # Add element to solution
+            A_g.append(best_element)
+            W.remove(best_element)
+            
+            # Update objective
+            current_obj = f(A_g)
+            stats["obj_evaluations"] += 1
+            stats["obj_history"].append(current_obj)
+            
+            # Update constraint values
+            for i in range(m):
+                constraint_values[i] += constraint_impact[i, best_element]
+            
+            if verbose:
+                print(f"Added element {best_element} (best ratio from constraint {best_i})")
+                print(f"New objective: {current_obj:.6f}")
+        else:
+            # Element violates constraints - remove from consideration
+            W.remove(best_element)
+            if verbose:
+                print(f"Element {best_element} violates constraints, removed from consideration")
+    
+    # Compute final statistics
+    stats["runtime"] = time.time() - start_time
+    stats["selected_count"] = len(A_g)
+    stats["final_constraints"] = constraint_values.tolist()
+    
+    if verbose:
+        print(f"Greedy selection complete:")
+        print(f"Final selection: {A_g}")
+        print(f"Final objective value: {current_obj:.6f}")
+        print(f"Runtime: {stats['runtime']:.2f} seconds")
+        print(f"Objective evaluations: {stats['obj_evaluations']}")
+        
+        # Report constraint satisfaction
+        for i in range(m):
+            utilization = constraint_values[i] / b[i] * 100 if b[i] != 0 else 0
+            print(f"Constraint {i}: {constraint_values[i]:.4f} / {b[i]:.4f} ({utilization:.1f}%)")
+    
+    return A_g, current_obj, stats
+
+
 # ======================================================================
 # Variance Information Calculation
 # ======================================================================
@@ -1433,6 +1593,87 @@ def round_solution(
         return np.zeros(n, dtype=int), 0.0
     
     return best_binary, best_obj
+
+def algorithm_3_continuous_multi_knapsack(
+    A: np.ndarray, 
+    b: np.ndarray, 
+    y: np.ndarray, 
+    verbose: bool = False
+) -> np.ndarray:
+    """
+    Multi-constraint version of Algorithm 3 (continuous contention resolution).
+    
+    Given:
+      - A: 2D array of shape (m, n), representing m knapsack constraints
+      - b: 1D array of shape (m,), the capacity bounds for each of the m constraints
+      - y: Fractional solution in [0,1]^n (possibly infeasible)
+    
+    Returns:
+      - w: A new solution in [0,1]^n that satisfies A w <= b
+    
+    Procedure (high-level):
+      1) Sort items in descending order of y_i.
+      2) Initialize leftover capacities leftover[j] = b[j] for each constraint j.
+      3) For each item i in sorted order:
+           - fraction_i = y[i]
+           - For each constraint j in 0..m-1:
+               if A[j, i] > 0:
+                   fraction_i = min(fraction_i, leftover[j] / A[j, i])
+           - w[i] = fraction_i
+           - Update leftover[j] -= A[j, i] * fraction_i for each j
+      4) By construction, A w <= b, and w[i] <= y[i].
+    """
+    m, n = A.shape
+    if n != len(y):
+        raise ValueError(f"Dimension mismatch: A is {m}x{n}, but y has length {len(y)}.")
+    if m != len(b):
+        raise ValueError(f"Dimension mismatch: A is {m}x{n}, but b has length {len(b)}.")
+    
+    # 1) Sort items by descending y_i
+    sorted_indices = np.argsort(-y)
+    
+    # 2) Initialize leftover capacity for each of the m constraints
+    leftover = b.copy()
+    
+    # 3) Allocate w
+    w = np.zeros_like(y)
+    
+    num_partial = 0  # Track how many items get partially cut
+    for idx in sorted_indices:
+        # Start by trying to keep the full fraction y[idx]
+        fraction_i = y[idx]
+        
+        # For each constraint j, see how much fraction we can afford
+        for j in range(m):
+            a_ji = A[j, idx]
+            if a_ji > 1e-14:  # Only matters if item i uses resource j
+                # fraction_i must not exceed leftover[j] / a_ji
+                max_feasible_fraction = leftover[j] / a_ji
+                if fraction_i > max_feasible_fraction:
+                    fraction_i = max_feasible_fraction
+        
+        # fraction_i is how much we actually keep
+        if fraction_i < y[idx] - 1e-14:
+            num_partial += 1
+        
+        w[idx] = max(0.0, fraction_i)  # Ensure nonnegative rounding
+        
+        # Update leftover capacities
+        for j in range(m):
+            a_ji = A[j, idx]
+            if a_ji > 1e-14:
+                used = a_ji * w[idx]
+                leftover[j] = max(leftover[j] - used, 0.0)
+    
+    if verbose:
+        # Check final usage
+        usage = A @ w
+        infeas_count = np.sum(usage > b + 1e-9)
+        print(f"[Algorithm 3 - Multi] Final usage: {usage} vs capacity {b}")
+        print(f"[Algorithm 3 - Multi] #Constraints violated: {infeas_count}")
+        print(f"[Algorithm 3 - Multi] #Items partially cut: {num_partial}")
+    
+    return w
 
 # ======================================================================
 # Run all methods and compare
@@ -1864,7 +2105,7 @@ def run_single_experiment(
         "obj": float(fw_obj),
         "time": end_fw - start_fw,
         "iterations": fw_iters,
-        # "selection": fw_x.tolist(),
+        "selection": fw_x.tolist(),
         "variance_info": fw_variance_info  # store the list of dicts
     }
     
@@ -1887,7 +2128,7 @@ def run_single_experiment(
     rounding_results = {
         "obj": float(rr_obj),
         "time": end_rr - start_rr,
-        # "selection": rr_x.tolist(),
+        "selection": rr_x.tolist(),
         "variance_info": rr_variance_info
     }
     
@@ -1924,7 +2165,7 @@ def run_single_experiment(
             "obj": float(gurobi_obj),
             "time": end_bc - start_bc,
             "stats": gurobi_stats_serial,
-            # "selection": gurobi_x.tolist(),
+             "selection": gurobi_x.tolist(),
             "variance_info": gurobi_variance_info
         }
     
@@ -2128,13 +2369,11 @@ def run_experiments_for_n_m_pairs(
         )
     print("-------------------------------------------------------------------------------------------")
 
-
-
 def main():
     logging.basicConfig(level=logging.INFO)
 
-    n_values = [500, 1000, 1500, 3000, 5000, 10000]   
-    m_values = [500, 1000, 1500, 3000, 5000, 10000]
+    n_values = [100, 500, 1000, 1500, 3000, 5000, 10000]
+    m_values = [10000]
     
     run_experiments_for_n_m_pairs(
         n_values=n_values,
@@ -2143,7 +2382,6 @@ def main():
         time_limit=None,   # pass a time limit if desired, e.g. 600 for 10 minutes
         verbose=False
     )
-
 
 if __name__ == "__main__":
     main()
