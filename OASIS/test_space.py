@@ -841,7 +841,7 @@ def branch_and_cut_gurobi(
     A: np.ndarray,
     b: np.ndarray,
     time_limit: int = 600,
-    mip_gap: float = 0.0,
+    mip_gap: float = 0.1,
     verbose: bool = False,
     cont_solution: np.ndarray = None
 ) -> Tuple[np.ndarray, float, Dict[str, Any]]:
@@ -1675,146 +1675,6 @@ def algorithm_3_continuous_multi_knapsack(
     
     return w
 
-# ======================================================================
-# Run all methods and compare
-# ======================================================================
-
-def solve_matrix_selection(
-    inf_mats: List[sp.spmatrix],
-    H0: sp.spmatrix,
-    A: np.ndarray,
-    b: np.ndarray,
-    verbose: bool = False,
-    time_limit: Optional[float] = None
-) -> Dict[str, Any]:
-    """
-    Solve the matrix selection problem using multiple methods and compare results.
-    
-    Args:
-        inf_mats: List of information matrices
-        H0: Prior information matrix
-        A: Inequality constraint matrix
-        b: Inequality constraint bounds
-        verbose: Whether to print detailed output
-        time_limit: Time limit for the Gurobi solver
-    
-    Returns:
-        Dictionary with results from all methods
-    """
-    results = {}
-    
-    # Generate initial point for Frank-Wolfe
-    n = len(inf_mats)
-    selection_init = np.zeros(n)
-    
-    # Method 1: Frank-Wolfe
-    logger.info("Running Frank-Wolfe optimization...")
-    start_time = time.time()
-    fw_x, fw_obj, fw_iters, fw_log = frank_wolfe_optimization(
-        min_eigenvalue_objective,
-        min_eigenvalue_gradient,
-        selection_init,
-        A,
-        b,
-        inf_mats,
-        H0,
-        max_iterations=1000,
-        min_iterations=3,
-        step_size_strategy=StepSizeStrategy.DIMINISHING,
-        verbose=True,
-        check_final_stationarity=False
-    )
-    fw_time = time.time() - start_time
-    
-    results["frank_wolfe"] = {
-        "x": fw_x,
-        "obj": fw_obj,
-        "time": fw_time,
-        "iterations": fw_iters,
-        "final_duality_gap": fw_log["duality_gap"][-1],
-        "log": fw_log
-    }
-
-    # Round the Frank-Wolfe solution
-    if fw_x is not None:
-        logger.info("Rounding Frank-Wolfe solution...")
-        if verbose:
-            logger.info("Analyzing variance information for Frank-Wolfe solution:")
-            compute_variance_info(A, fw_x)
-            
-        fw_binary_x, fw_binary_obj = round_solution(
-            fw_x,
-            inf_mats,
-            H0,
-            A,
-            b,
-            obj_func=min_eigenvalue_objective,
-            num_samples=100,
-            verbose=verbose
-        )
-        
-        results["frank_wolfe"]["x_binary"] = fw_binary_x
-        results["frank_wolfe"]["obj_binary"] = fw_binary_obj
-    
-    # # Method 2: Greedy 0/1 Selection
-    # logger.info("Running greedy 0/1 selection...")
-    # start_time = time.time()
-    # greedy_x, greedy_obj, greedy_stats = greedy_01_selection(
-    #     inf_mats,
-    #     H0,
-    #     A,
-    #     b,
-    #     obj_func=min_eigenvalue_objective,
-    #     verbose=verbose
-    # )
-    # greedy_time = time.time() - start_time
-    
-    # results["greedy"] = {
-    #     "x": greedy_x,
-    #     "obj": greedy_obj,
-    #     "time": greedy_time
-    # }
-    
-    # Method 4: Gurobi Branch and Cut
-    logger.info("Running Gurobi branch and cut...")
-    if GUROBI_AVAILABLE:
-        start_time = time.time()
-        gurobi_x, gurobi_obj, gurobi_stats = branch_and_cut_gurobi(
-            inf_mats,
-            H0,
-            A,
-            b,
-            # time_limit=time_limit,
-            verbose=verbose
-        )
-        gurobi_time = time.time() - start_time
-        
-        results["gurobi"] = {
-            "x": gurobi_x,
-            "obj": gurobi_obj,
-            "time": gurobi_time,
-            "stats": gurobi_stats
-        }
-    else:
-        results["gurobi"] = {
-            "status": "Gurobi not available"
-        }
-    
-    # Compare all methods
-    logger.info("\nResults Summary:")
-    for method, result in results.items():
-        if method == "frank_wolfe":
-            logger.info(f"Frank-Wolfe: obj={result['obj']:.6f}, time={result['time']:.2f}s, iterations={result['iterations']}")
-        elif method == "greedy":
-            logger.info(f"Greedy 0/1: obj={result['obj']:.6f}, time={result['time']:.2f}s")
-        elif method == "cvxpy" and "obj_continuous" in result:
-            logger.info(f"CVXPY continuous: obj={result['obj_continuous']:.6f}, time={result['time']:.2f}s")
-            if "obj_binary" in result:
-                logger.info(f"CVXPY rounded: obj={result['obj_binary']:.6f}")
-        elif method == "gurobi" and "obj" in result:
-            logger.info(f"Gurobi branch-and-cut: obj={result['obj']:.6f}, time={result['time']:.2f}s")
-    
-    return results
 
 def generate_test_problem_from_algorithm4(
     n: int = 100,
@@ -1924,13 +1784,13 @@ def generate_test_problem_from_algorithm4(
     # Total Weight Constraint: sum(w_i * x_i) <= max_weight
     weights = np.random.uniform(1, 5, size=n)
     A_weight = weights.reshape(1, -1)
-    max_weight = round(0.1*sum(weights))
+    max_weight = 100
     b_weight = np.array([max_weight])
     
     # Total Cost Constraint: sum(c_i * x_i) <= max_cost
     costs = np.random.uniform(10, 20, size=n)
     A_cost = costs.reshape(1, -1)
-    max_cost = round(0.1*sum(weights))
+    max_cost = 1000
     b_cost = np.array([max_cost])
     
     # Stack all constraints together
@@ -1943,120 +1803,6 @@ def generate_test_problem_from_algorithm4(
     logger.info("Test problem generation complete.")
     
     return n, m, inf_mats, H0, A_ineq, b_ineq, selection_init, weights, costs
-
-def run_algorithm4_example(verbose=True, n=100, m=10, gamma=0.01):
-    """
-    Run an example using matrices generated from Algorithm 4
-    
-    Args:
-        verbose: Whether to print detailed output
-        n: Number of matrices
-        m: Size of matrices (number of vertices in graph)
-        gamma: Eigenvalue gap parameter
-    
-    Returns:
-        Dictionary with results from all methods
-    """
-    if verbose:
-        logger.info("Generating test problem using Algorithm 4...")
-    
-    n, m, inf_mats, H0, A_ineq, b_ineq, selection_init, weights, costs = generate_test_problem_from_algorithm4(
-        n=n,
-        m=m,
-        cardinality=int(0.1*n),
-        seed=42,
-        gamma=gamma
-    )
-    
-    if verbose:
-        logger.info("Problem setup:")
-        logger.info(f"  Number of matrices: {n}")
-        logger.info(f"  Matrix size: {m}x{m}")
-        logger.info(f"  Cardinality constraint: {b_ineq[0][0]}")
-        logger.info(f"  Weight constraint: {b_ineq[1][0]:.2f} / {sum(weights):.2f}")
-        logger.info(f"  Cost constraint: {b_ineq[2][0]:.2f} / {sum(costs):.2f}")
-        logger.info(f"  Controlled eigenvalue gap: {gamma}")
-    
-    results = solve_matrix_selection(
-        inf_mats,
-        H0,
-        A_ineq,
-        b_ineq,
-        verbose=verbose
-    )
-    
-    # Print final comparison and additional analysis
-    print("\nFinal Method Comparison (Algorithm 4 Test Matrices):")
-    print("-" * 70)
-    print(f"{'Method':<20} {'Objective':<10} {'Time (s)':<10} {'Type':<10} {'Selected':<10}")
-    print("-" * 70)
-    
-    # Compare binary solutions
-    binary_solutions = {}
-    
-    if "frank_wolfe" in results:
-        print(f"{'Frank-Wolfe':<20} {results['frank_wolfe']['obj']:<10.6f} {results['frank_wolfe']['time']:<10.2f} {'Continuous':<10} {'N/A':<10}")
-        if "obj_binary" in results["frank_wolfe"]:
-            binary_solutions["FW"] = results["frank_wolfe"]["x_binary"]
-            selected_count = np.sum(results["frank_wolfe"]["x_binary"])
-            print(f"{'FW Rounded':<20} {results['frank_wolfe']['obj_binary']:<10.6f} {'N/A':<10} {'Binary':<10} {int(selected_count):<10}")
-    
-    if "greedy" in results:
-        binary_solutions["Greedy"] = results["greedy"]["x"]
-        selected_count = np.sum(results["greedy"]["x"])
-        print(f"{'Greedy 0/1':<20} {results['greedy']['obj']:<10.6f} {results['greedy']['time']:<10.2f} {'Binary':<10} {int(selected_count):<10}")
-    
-    if "gurobi" in results and "obj" in results["gurobi"]:
-        binary_solutions["Gurobi"] = results["gurobi"]["x"]
-        selected_count = np.sum(results["gurobi"]["x"])
-        print(f"{'Gurobi B&C':<20} {results['gurobi']['obj']:<10.6f} {results['gurobi']['time']:<10.2f} {'Binary':<10} {int(selected_count):<10}")
-    
-    print("-" * 70)
-    
-    # Compare binary solutions
-    if len(binary_solutions) > 1:
-        print("\nBinary Solution Comparison:")
-        methods = list(binary_solutions.keys())
-        
-        for i in range(len(methods)):
-            for j in range(i+1, len(methods)):
-                method1 = methods[i]
-                method2 = methods[j]
-                
-                sol1 = binary_solutions[method1]
-                sol2 = binary_solutions[method2]
-                
-                # Find differences
-                diff_indices = np.where(sol1 != sol2)[0]
-                
-                if len(diff_indices) > 0:
-                    print(f"\n{method1} vs {method2}:")
-                    print(f"  Different selections at {len(diff_indices)} indices")
-                    
-                    # Show some examples of differences
-                    if len(diff_indices) > 5:
-                        diff_sample = diff_indices[:5]
-                        print(f"  First 5 differences: {diff_sample}")
-                    else:
-                        print(f"  Differences: {diff_indices}")
-                        
-                    # Show which solution is better
-                    # Modify this part to handle different method names
-                    def get_objective(method):
-                        if method == "FW":
-                            return results['frank_wolfe'].get('obj_binary', results['frank_wolfe'].get('obj', float('-inf')))
-                        elif method == "Greedy":
-                            return results['greedy']['obj']
-                        elif method == "Gurobi":
-                            return results.get('gurobi', {}).get('obj', float('-inf'))
-                        return float('-inf')
-                    
-                    print(f"  {method1} objective: {get_objective(method1):.6f}")
-                    print(f"  {method2} objective: {get_objective(method2):.6f}")
-                else:
-                    print(f"\n{method1} vs {method2}: Solutions are identical")
-    # Return the results
-    return results
 
 def run_single_experiment(
     n: int, 
@@ -2091,7 +1837,7 @@ def run_single_experiment(
         inf_mats=inf_mats,
         H0=H0,
         max_iterations=1000,
-        min_iterations=3,
+        min_iterations=2,
         convergence_tol=2e-2,
         verbose=verbose,
         check_final_stationarity=False
@@ -2267,7 +2013,7 @@ def aggregate_stats(runs_data: List[Dict[str, Any]]) -> Dict[str, Any]:
 def run_experiments_for_n_m_pairs(
     n_values: List[int],
     m_values: List[int],
-    num_runs: int = 5,
+    num_runs: int = 10,
     time_limit: Optional[float] = None,
     verbose: bool = False
 ):
@@ -2372,7 +2118,7 @@ def run_experiments_for_n_m_pairs(
 def main():
     logging.basicConfig(level=logging.INFO)
 
-    n_values = [100, 500, 1000, 1500, 3000, 5000, 10000]
+    n_values = [15000, 20000, 25000, 30000]
     m_values = [10000]
     
     run_experiments_for_n_m_pairs(
