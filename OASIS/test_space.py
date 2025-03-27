@@ -10,6 +10,9 @@ import warnings
 import networkx as nx
 import json
 import statistics
+import argparse
+import os
+
 
 # Set up logging
 logging.basicConfig(
@@ -1268,7 +1271,7 @@ def greedy_algorithm_2(
     f: Callable[[List[int]], float],
     A: np.ndarray,
     b: np.ndarray,
-    verbose: bool = False,
+    verbose: bool = True,
     timeout: Optional[float] = None
 ) -> Tuple[List[int], float, Dict[str, Any]]:
     """
@@ -1406,7 +1409,7 @@ def greedy_algorithm_2(
     # Compute final statistics
     stats["runtime"] = time.time() - start_time
     stats["selected_count"] = len(A_g)
-    stats["final_constraints"] = constraint_values.tolist()
+    stats["final_constraints"] = constraint_values.tolist()  # Convert to list for JSON
     
     if verbose:
         print(f"Greedy selection complete:")
@@ -1415,10 +1418,13 @@ def greedy_algorithm_2(
         print(f"Runtime: {stats['runtime']:.2f} seconds")
         print(f"Objective evaluations: {stats['obj_evaluations']}")
         
-        # Report constraint satisfaction
+        # Report constraint satisfaction - FIX HERE
         for i in range(m):
-            utilization = constraint_values[i] / b[i] * 100 if b[i] != 0 else 0
-            print(f"Constraint {i}: {constraint_values[i]:.4f} / {b[i]:.4f} ({utilization:.1f}%)")
+            # Convert numpy values to Python floats before formatting
+            constraint_val = float(constraint_values[i])
+            bound_val = float(b[i][0]) if isinstance(b[i], np.ndarray) else float(b[i])
+            utilization = constraint_val / bound_val * 100 if bound_val != 0 else 0
+            print(f"Constraint {i}: {constraint_val:.4f} / {bound_val:.4f} ({utilization:.1f}%)")
     
     return A_g, current_obj, stats
 
@@ -1594,87 +1600,204 @@ def round_solution(
     
     return best_binary, best_obj
 
-def algorithm_3_continuous_multi_knapsack(
-    A: np.ndarray, 
-    b: np.ndarray, 
-    y: np.ndarray, 
+def algorithm_3_contention_resolution_rounding(
+    x_star: np.ndarray,
+    A: np.ndarray,
+    b: np.ndarray,
+    seed: Optional[int] = None,
+    num_samples: int = 1,
+    verbose: bool = True
+) -> np.ndarray:
+    """
+    Implementation of Algorithm 3: Contention Resolution Rounding.
+    
+    Given:
+      - x_star: Continuous solution in [0,1]^n to be rounded
+      - A: Matrix of shape (m, n) for m constraints over n items
+      - b: Vector of shape (m,) with constraint bounds
+      - seed: Random seed for reproducibility
+      - num_samples: Number of rounding attempts to perform (more attempts can improve quality)
+      - verbose: Whether to print progress information
+    
+    Returns:
+      - omega: A binary solution in {0,1}^n that satisfies A·omega ≤ b
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    m, n = A.shape
+    assert n == len(x_star), f"Dimension mismatch: A is {m}x{n}, but x_star has length {len(x_star)}"
+    assert m == len(b), f"Dimension mismatch: A is {m}x{n}, but b has length {len(b)}"
+    
+    best_omega = None
+    best_objective = float('-inf')
+    
+    # Try multiple samples to get the best result
+    for sample in range(num_samples):
+        if verbose and num_samples > 1:
+            print(f"Attempt {sample+1}/{num_samples}")
+        
+        # Step 1: Independent randomized rounding (Bernoulli trials)
+        y = np.random.random(n) <= x_star
+        
+        # Step 2: Apply KNAPSACK-CR for each constraint
+        tau_results = []
+        
+        for j in range(m):
+            # Perform knapsack contention resolution for constraint j
+            tau_j = knapsack_cr(A[j], b[j], y, verbose=verbose if sample == 0 else False)
+            tau_results.append(tau_j)
+        
+        # Step 3: Compute intersection of all solutions
+        omega = np.ones(n, dtype=bool)
+        for tau in tau_results:
+            omega = np.logical_and(omega, tau)
+        
+        # Convert boolean array to int array (0s and 1s)
+        omega = omega.astype(int)
+        
+        # Calculate objective value (here we use sum as a simple measure,
+        # but you might want to use your actual objective function)
+        obj_value = omega.sum()
+        
+        # Keep track of the best solution found
+        if obj_value > best_objective:
+            best_objective = obj_value
+            best_omega = omega.copy()
+        
+        if verbose and num_samples > 1:
+            print(f"  Solution quality: {obj_value}")
+    
+    # Final solution
+    omega = best_omega
+    
+    if verbose:
+        # Check final feasibility
+        violations = []
+        for j in range(m):
+            usage = A[j] @ omega
+            if usage > b[j] + 1e-9:
+                violations.append((j, usage, b[j]))
+        
+        print(f"Final solution selects {omega.sum()} elements")
+        
+        if violations:
+            print("WARNING: Solution has constraint violations:")
+            for j, usage, capacity in violations:
+                print(f"  Constraint {j}: {usage:.4f} > {capacity:.4f}")
+        else:
+            print("Solution is feasible for all constraints")
+    
+    return omega
+
+def knapsack_cr(
+    a_j: np.ndarray,
+    b_j: np.ndarray,
+    y: np.ndarray,
     verbose: bool = False
 ) -> np.ndarray:
     """
-    Multi-constraint version of Algorithm 3 (continuous contention resolution).
+    KNAPSACK-CR procedure for a single constraint.
     
-    Given:
-      - A: 2D array of shape (m, n), representing m knapsack constraints
-      - b: 1D array of shape (m,), the capacity bounds for each of the m constraints
-      - y: Fractional solution in [0,1]^n (possibly infeasible)
+    Args:
+        a_j: Vector of resource requirements for constraint j
+        b_j: Capacity bound for constraint j (could be scalar or array)
+        y: Binary vector from Bernoulli sampling
+        verbose: Whether to print progress
     
     Returns:
-      - w: A new solution in [0,1]^n that satisfies A w <= b
-    
-    Procedure (high-level):
-      1) Sort items in descending order of y_i.
-      2) Initialize leftover capacities leftover[j] = b[j] for each constraint j.
-      3) For each item i in sorted order:
-           - fraction_i = y[i]
-           - For each constraint j in 0..m-1:
-               if A[j, i] > 0:
-                   fraction_i = min(fraction_i, leftover[j] / A[j, i])
-           - w[i] = fraction_i
-           - Update leftover[j] -= A[j, i] * fraction_i for each j
-      4) By construction, A w <= b, and w[i] <= y[i].
+        tau_j: Binary vector indicating which elements to keep
     """
-    m, n = A.shape
-    if n != len(y):
-        raise ValueError(f"Dimension mismatch: A is {m}x{n}, but y has length {len(y)}.")
-    if m != len(b):
-        raise ValueError(f"Dimension mismatch: A is {m}x{n}, but b has length {len(b)}.")
+    n = len(a_j)
+    assert n == len(y), "Dimension mismatch between a_j and y"
     
-    # 1) Sort items by descending y_i
-    sorted_indices = np.argsort(-y)
+    # Initialize empty solution
+    tau = np.zeros(n, dtype=bool)
     
-    # 2) Initialize leftover capacity for each of the m constraints
-    leftover = b.copy()
+    # Extract scalar value from b_j if it's an array
+    if isinstance(b_j, np.ndarray):
+        capacity = float(b_j.item()) if b_j.size == 1 else float(b_j[0])
+    else:
+        capacity = float(b_j)
     
-    # 3) Allocate w
-    w = np.zeros_like(y)
+    # We only consider elements where y[i] = 1
+    candidate_indices = np.where(y)[0]
     
-    num_partial = 0  # Track how many items get partially cut
-    for idx in sorted_indices:
-        # Start by trying to keep the full fraction y[idx]
-        fraction_i = y[idx]
+    if len(candidate_indices) == 0:
+        return tau
+    
+    # Get resource requirements for candidate elements
+    resource_requirements = a_j[candidate_indices]
+    
+    # Sort candidates by increasing resource requirement
+    sorted_idx = np.argsort(resource_requirements)
+    sorted_candidates = candidate_indices[sorted_idx]
+    
+    # Track remaining capacity
+    remaining_capacity = capacity
+    
+    # Greedily add elements in order of increasing resource requirement
+    for i in sorted_candidates:
+        # Convert resource requirement to float before comparison
+        req = float(a_j[i])
         
-        # For each constraint j, see how much fraction we can afford
-        for j in range(m):
-            a_ji = A[j, idx]
-            if a_ji > 1e-14:  # Only matters if item i uses resource j
-                # fraction_i must not exceed leftover[j] / a_ji
-                max_feasible_fraction = leftover[j] / a_ji
-                if fraction_i > max_feasible_fraction:
-                    fraction_i = max_feasible_fraction
-        
-        # fraction_i is how much we actually keep
-        if fraction_i < y[idx] - 1e-14:
-            num_partial += 1
-        
-        w[idx] = max(0.0, fraction_i)  # Ensure nonnegative rounding
-        
-        # Update leftover capacities
-        for j in range(m):
-            a_ji = A[j, idx]
-            if a_ji > 1e-14:
-                used = a_ji * w[idx]
-                leftover[j] = max(leftover[j] - used, 0.0)
+        # If including this element doesn't violate the constraint
+        if req <= remaining_capacity + 1e-9:
+            tau[i] = True
+            remaining_capacity -= req
     
     if verbose:
-        # Check final usage
-        usage = A @ w
-        infeas_count = np.sum(usage > b + 1e-9)
-        print(f"[Algorithm 3 - Multi] Final usage: {usage} vs capacity {b}")
-        print(f"[Algorithm 3 - Multi] #Constraints violated: {infeas_count}")
-        print(f"[Algorithm 3 - Multi] #Items partially cut: {num_partial}")
+        usage = float(a_j @ tau)
+        print(f"KNAPSACK-CR for constraint used {usage:.4f}/{capacity:.4f} capacity")
     
-    return w
+    return tau
 
+def round_solution_with_cr(
+    cont_sol: np.ndarray,
+    inf_mats: List[sp.spmatrix],
+    H0: sp.spmatrix,
+    A: np.ndarray,
+    b: np.ndarray,
+    obj_func: Callable,
+    num_samples: int = 10,
+    verbose: bool = True
+) -> Tuple[np.ndarray, float]:
+    """
+    Round a continuous solution using Contention Resolution (CR).
+    
+    Args:
+        cont_sol: Continuous solution in [0,1]^n
+        inf_mats: List of information matrices
+        H0: Prior information matrix
+        A: Constraint matrix
+        b: Constraint bounds
+        obj_func: Objective function
+        num_samples: Number of rounding attempts
+        verbose: Whether to print progress
+    
+    Returns:
+        Tuple of (rounded binary solution, objective value)
+    """
+    if verbose:
+        print("Rounding solution using Contention Resolution method...")
+    
+    # Perform contention resolution rounding
+    binary_sol = algorithm_3_contention_resolution_rounding(
+        x_star=cont_sol,
+        A=A,
+        b=b,
+        num_samples=num_samples,
+        verbose=verbose
+    )
+    
+    # Calculate objective value of rounded solution
+    obj_val = obj_func(binary_sol, inf_mats, H0)
+    
+    if verbose:
+        print(f"Rounded solution objective: {obj_val:.6f}")
+        print(f"Selected {np.sum(binary_sol)} elements")
+    
+    return binary_sol, obj_val
 
 def generate_test_problem_from_algorithm4(
     n: int = 100,
@@ -1808,12 +1931,37 @@ def run_single_experiment(
     n: int, 
     m: int, 
     seed: int, 
+    algorithms: List[str] = ["fw", "rounding", "greedy", "gurobi"],
     time_limit: Optional[float] = None, 
-    verbose: bool = False
+    verbose: bool = True
 ) -> Dict[str, Any]:
     """
     Runs one single 'experiment' for the pair (n, m),
     storing selection vectors and variance info for each method.
+    
+    Parameters:
+    -----------
+    n : int
+        Problem dimension n
+    m : int
+        Problem dimension m
+    seed : int
+        Random seed for reproducibility
+    algorithms : List[str]
+        List of algorithms to run. Options include:
+        - "fw": Continuous Frank-Wolfe
+        - "rounding": Randomized Rounding (requires "fw")
+        - "greedy": Greedy Algorithm
+        - "gurobi": Gurobi Branch and Cut
+    time_limit : Optional[float]
+        Time limit in seconds
+    verbose : bool
+        Whether to print progress information
+    
+    Returns:
+    --------
+    Dict[str, Any]
+        Dictionary with results for each algorithm
     """
     np.random.seed(seed)
     
@@ -1825,232 +1973,671 @@ def run_single_experiment(
         seed=seed
     )
     
-    reset_min_eig_gradient_cache()
+    run_dict = {}
+    fw_x = None  # Store FW solution for use by other algorithms
+    
     # -- 2) Continuous Frank–Wolfe --
-    start_fw = time.time()
-    fw_x, fw_obj, fw_iters, fw_log = frank_wolfe_optimization(
-        obj_func=min_eigenvalue_objective,
-        obj_grad=min_eigenvalue_gradient,
-        selection_init=selection_init,
-        A=A_ineq,
-        b=b_ineq,
-        inf_mats=inf_mats,
-        H0=H0,
-        max_iterations=1000,
-        min_iterations=2,
-        convergence_tol=2e-2,
-        verbose=verbose,
-        check_final_stationarity=False
-    )
-    end_fw = time.time()
-    
-    # Compute & print variance info, store as JSON
-    fw_variance_info = compute_variance_info(A_ineq, fw_x)
-    
-    continuous_results = {
-        "obj": float(fw_obj),
-        "time": end_fw - start_fw,
-        "iterations": fw_iters,
-        "selection": fw_x.tolist(),
-        "variance_info": fw_variance_info  # store the list of dicts
-    }
+    if "fw" in algorithms:
+        reset_min_eig_gradient_cache()
+        start_fw = time.time()
+        fw_x, fw_obj, fw_iters, fw_log = frank_wolfe_optimization(
+            obj_func=min_eigenvalue_objective,
+            obj_grad=min_eigenvalue_gradient,
+            selection_init=selection_init,
+            A=A_ineq,
+            b=b_ineq,
+            inf_mats=inf_mats,
+            H0=H0,
+            max_iterations=1000,
+            min_iterations=2,
+            convergence_tol=2e-2,
+            verbose=verbose,
+            check_final_stationarity=False
+        )
+        end_fw = time.time()
+        
+        # Compute & print variance info, store as JSON
+        fw_variance_info = compute_variance_info(A_ineq, fw_x)
+        
+        run_dict["continuous_relaxation"] = {
+            "obj": float(fw_obj),
+            "time": end_fw - start_fw,
+            "iterations": fw_iters,
+            "selection": fw_x.tolist(),
+            "variance_info": fw_variance_info  # store the list of dicts
+        }
     
     # -- 3) Randomized Rounding --
-    start_rr = time.time()
-    rr_x, rr_obj = round_solution(
-        cont_sol=fw_x,
-        inf_mats=inf_mats,
-        H0=H0,
-        A=A_ineq,
-        b=b_ineq,
-        obj_func=min_eigenvalue_objective,
-        num_samples=100,
-        verbose=verbose
-    )
-    end_rr = time.time()
-    
-    rr_variance_info = compute_variance_info(A_ineq, rr_x)
-    
-    rounding_results = {
-        "obj": float(rr_obj),
-        "time": end_rr - start_rr,
-        "selection": rr_x.tolist(),
-        "variance_info": rr_variance_info
-    }
-    
-    # -- 4) Gurobi Branch & Cut --
-    start_bc = time.time()
-    gurobi_x, gurobi_obj, gurobi_stats = branch_and_cut_gurobi(
-        inf_mats=inf_mats,
-        H0=H0,
-        A=A_ineq,
-        b=b_ineq,
-        time_limit=time_limit,
-        verbose=True,
-        cont_solution=None
-    )
-    end_bc = time.time()
-    
-    if gurobi_x is None:
-        gurobi_results = {
-            "obj": float('-inf'),
-            "time": end_bc - start_bc,
-            "stats": {"status": "GUROBI_FAILED_OR_UNAVAILABLE"},
-            "selection": [],
-            "variance_info": []
-        }
-    else:
-        gurobi_variance_info = compute_variance_info(A_ineq, gurobi_x)
+    if "rounding" in algorithms:
+        if fw_x is None and "fw" not in algorithms:
+            if verbose:
+                print("Warning: Randomized rounding requested but Frank-Wolfe not run.")
+                print("Using initial selection as input to rounding.")
+            continuous_solution = selection_init
+        else:
+            continuous_solution = fw_x
+            
+        start_rr = time.time()
+        rr_x, rr_obj = round_solution(
+            cont_sol=continuous_solution,
+            inf_mats=inf_mats,
+            H0=H0,
+            A=A_ineq,
+            b=b_ineq,
+            obj_func=min_eigenvalue_objective,
+            num_samples=100,
+            verbose=verbose
+        )
+        end_rr = time.time()
         
-        # Convert stats
-        gurobi_stats_serial = {
-            k: float(v) if isinstance(v, (int, float, np.float64)) else v
-            for k, v in gurobi_stats.items()
-        }
-        gurobi_results = {
-            "obj": float(gurobi_obj),
-            "time": end_bc - start_bc,
-            "stats": gurobi_stats_serial,
-             "selection": gurobi_x.tolist(),
-            "variance_info": gurobi_variance_info
+        rr_variance_info = compute_variance_info(A_ineq, rr_x)
+        
+        run_dict["randomized_rounding"] = {
+            "obj": float(rr_obj),
+            "time": end_rr - start_rr,
+            "selection": rr_x.tolist(),
+            "variance_info": rr_variance_info
         }
     
-    # -- 5) Compile results for JSON --
-    run_dict = {
-        "continuous_relaxation": continuous_results,
-        "randomized_rounding": rounding_results,
-        "gurobi": gurobi_results
-    }
+    # -- 4) Greedy Algorithm --
+    if "greedy" in algorithms:
+        start_greedy = time.time()
+        
+        # Define objective function for greedy algorithm
+        def objective_function(selected_indices):
+            if not selected_indices:
+                return min_eigenvalue_objective(np.zeros(n), inf_mats, H0)
+            
+            selection = np.zeros(n, dtype=int)
+            for idx in selected_indices:
+                selection[idx] = 1
+            return min_eigenvalue_objective(selection, inf_mats, H0)
+        
+        ground_set = list(range(n))
+        greedy_selection, greedy_obj, greedy_stats = greedy_algorithm_2(
+            ground_set=ground_set,
+            f=objective_function,
+            A=A_ineq,
+            b=b_ineq,
+            verbose=verbose,
+            timeout=time_limit
+        )
+        
+        # Convert greedy selection to binary vector
+        greedy_x = np.zeros(n, dtype=int)
+        for idx in greedy_selection:
+            greedy_x[idx] = 1
+        
+        end_greedy = time.time()
+        
+        greedy_variance_info = compute_variance_info(A_ineq, greedy_x)
+        
+        run_dict["greedy"] = {
+            "obj": float(greedy_obj),
+            "time": end_greedy - start_greedy,
+            "iterations": greedy_stats["iterations"],
+            "obj_evaluations": greedy_stats["obj_evaluations"],
+            "selection": greedy_x.tolist(),
+            "variance_info": greedy_variance_info
+        }
+    
+    # -- 5) Gurobi Branch & Cut --
+    if "gurobi" in algorithms:
+        try:
+            start_bc = time.time()
+            gurobi_x, gurobi_obj, gurobi_stats = branch_and_cut_gurobi(
+                inf_mats=inf_mats,
+                H0=H0,
+                A=A_ineq,
+                b=b_ineq,
+                time_limit=time_limit,
+                verbose=verbose,
+                cont_solution=fw_x if fw_x is not None else None
+            )
+            end_bc = time.time()
+            
+            if gurobi_x is None:
+                run_dict["gurobi"] = {
+                    "obj": float('-inf'),
+                    "time": end_bc - start_bc,
+                    "stats": {"status": "GUROBI_FAILED"},
+                    "selection": [],
+                    "variance_info": []
+                }
+            else:
+                gurobi_variance_info = compute_variance_info(A_ineq, gurobi_x)
+                
+                # Convert stats
+                gurobi_stats_serial = {
+                    k: float(v) if isinstance(v, (int, float, np.float64)) else v
+                    for k, v in gurobi_stats.items()
+                }
+                run_dict["gurobi"] = {
+                    "obj": float(gurobi_obj),
+                    "time": end_bc - start_bc,
+                    "stats": gurobi_stats_serial,
+                    "selection": gurobi_x.tolist(),
+                    "variance_info": gurobi_variance_info
+                }
+        except Exception as e:
+            if verbose:
+                print(f"Error running Gurobi: {str(e)}")
+            run_dict["gurobi"] = {
+                "obj": float('-inf'),
+                "time": 0.0,
+                "stats": {"status": f"ERROR: {str(e)}"},
+                "selection": [],
+                "variance_info": []
+            }
     
     return run_dict
 
 def aggregate_stats(runs_data: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Given a list of run dictionaries (each one has
-       "continuous_relaxation" -> {"obj":..., "time":..., "iterations":...}
-       "randomized_rounding"   -> {"obj":..., "time":...}
-       "gurobi"                -> {"obj":..., "time":..., "stats":...}
-    ), compute aggregated statistics: mean, std, min, max for "obj" and mean, std for "time".
+    Given a list of run dictionaries, compute aggregated statistics for each algorithm.
     
-    Returns a dict with the "stats" block you requested.
+    Parameters:
+    -----------
+    runs_data : List[Dict[str, Any]]
+        List of dictionaries with results from each run
+    
+    Returns:
+    --------
+    Dict[str, Any]
+        Aggregated statistics
     """
-    continuous_objs = []
-    continuous_times = []
-    continuous_iters = []
-    
-    rounding_objs = []
-    rounding_times = []
-    
-    gurobi_objs = []
-    gurobi_times = []
-    
-    # Populate
+    # Check which algorithms were run
+    available_algorithms = set()
     for run_dict in runs_data:
-        # Continuous
-        c_rel = run_dict["continuous_relaxation"]
-        continuous_objs.append(c_rel["obj"])
-        continuous_times.append(c_rel["time"])
-        continuous_iters.append(c_rel["iterations"])
-        
-        # Randomized rounding
-        rr = run_dict["randomized_rounding"]
-        rounding_objs.append(rr["obj"])
-        rounding_times.append(rr["time"])
-        
-        # Gurobi
-        grb = run_dict["gurobi"]
-        gurobi_objs.append(grb["obj"])
-        gurobi_times.append(grb["time"])
+        available_algorithms.update(run_dict.keys())
     
-    def stats_1d(values):
-        d = {}
-        arr = [float(v) for v in values]
-        d["mean"] = float(np.mean(arr))
-        d["std"] = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
-        d["min"] = float(np.min(arr))
-        d["max"] = float(np.max(arr))
-        return d
+    # Map of algorithm keys to their display names in stats
+    algorithm_keys = {
+        "continuous_relaxation": "continuous_relaxation",
+        "randomized_rounding": "randomized_rounding",
+        "greedy": "greedy",
+        "gurobi": "gurobi"
+    }
     
-    # Build stats block
     stats_block = {
         "num_runs": len(runs_data),
-        
-        "continuous_relaxation": {
-            "obj_mean": stats_1d(continuous_objs)["mean"],
-            "obj_std":  stats_1d(continuous_objs)["std"],
-            "obj_min":  stats_1d(continuous_objs)["min"],
-            "obj_max":  stats_1d(continuous_objs)["max"],
-            "time_mean": stats_1d(continuous_times)["mean"],
-            "time_std":  stats_1d(continuous_times)["std"],
-            # optionally store iteration stats as well
-            "iterations_mean": stats_1d(continuous_iters)["mean"],
-            "iterations_std":  stats_1d(continuous_iters)["std"],
-        },
-        
-        "randomized_rounding": {
-            "obj_mean": stats_1d(rounding_objs)["mean"],
-            "obj_std":  stats_1d(rounding_objs)["std"],
-            "obj_min":  stats_1d(rounding_objs)["min"],
-            "obj_max":  stats_1d(rounding_objs)["max"],
-            "time_mean": stats_1d(rounding_times)["mean"],
-            "time_std":  stats_1d(rounding_times)["std"]
-        },
-        
-        "gurobi": {
-            "obj_mean": stats_1d(gurobi_objs)["mean"],
-            "obj_std":  stats_1d(gurobi_objs)["std"],
-            "obj_min":  stats_1d(gurobi_objs)["min"],
-            "obj_max":  stats_1d(gurobi_objs)["max"],
-            "time_mean": stats_1d(gurobi_times)["mean"],
-            "time_std":  stats_1d(gurobi_times)["std"]
-        }
     }
+    
+    # For each available algorithm, compute statistics
+    for algo_key in available_algorithms:
+        # Skip if not a recognized algorithm
+        if algo_key not in algorithm_keys:
+            continue
+            
+        # Initialize collectors for metrics
+        objs = []
+        times = []
+        iterations = []
+        
+        # Collect data across all runs
+        for run_dict in runs_data:
+            if algo_key in run_dict:
+                algo_data = run_dict[algo_key]
+                objs.append(algo_data["obj"])
+                times.append(algo_data["time"])
+                if "iterations" in algo_data:
+                    iterations.append(algo_data["iterations"])
+        
+        # Skip if no data (algorithm wasn't run in any iteration)
+        if not objs:
+            continue
+            
+        def stats_1d(values):
+            d = {}
+            arr = [float(v) for v in values]
+            d["mean"] = float(np.mean(arr))
+            d["std"] = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+            d["min"] = float(np.min(arr))
+            d["max"] = float(np.max(arr))
+            return d
+        
+        # Calculate statistics
+        algo_stats = {
+            "obj_mean": stats_1d(objs)["mean"],
+            "obj_std":  stats_1d(objs)["std"],
+            "obj_min":  stats_1d(objs)["min"],
+            "obj_max":  stats_1d(objs)["max"],
+            "time_mean": stats_1d(times)["mean"],
+            "time_std":  stats_1d(times)["std"],
+        }
+        
+        # Add iteration stats if available
+        if iterations:
+            algo_stats.update({
+                "iterations_mean": stats_1d(iterations)["mean"],
+                "iterations_std":  stats_1d(iterations)["std"],
+            })
+        
+        # Store statistics
+        stats_block[algorithm_keys[algo_key]] = algo_stats
     
     return stats_block
 
+def run_single_experiment(
+    n: int, 
+    m: int, 
+    seed: int, 
+    algorithms: List[str] = ["fw", "rounding", "cr", "greedy", "gurobi"],
+    time_limit: Optional[float] = None, 
+    verbose: bool = True
+) -> Dict[str, Any]:
+    """
+    Runs one single 'experiment' for the pair (n, m),
+    storing selection vectors and variance info for each method.
+    
+    Parameters:
+    -----------
+    n : int
+        Problem dimension n
+    m : int
+        Problem dimension m
+    seed : int
+        Random seed for reproducibility
+    algorithms : List[str]
+        List of algorithms to run. Options include:
+        - "fw": Continuous Frank-Wolfe
+        - "rounding": Randomized Rounding (requires "fw")
+        - "cr": Contention Resolution Rounding (requires "fw")
+        - "greedy": Greedy Algorithm
+        - "gurobi": Gurobi Branch and Cut
+    time_limit : Optional[float]
+        Time limit in seconds
+    verbose : bool
+        Whether to print progress information
+    
+    Returns:
+    --------
+    Dict[str, Any]
+        Dictionary with results for each algorithm
+    """
+    np.random.seed(seed)
+    
+    # -- 1) Generate problem --
+    _, _, inf_mats, H0, A_ineq, b_ineq, selection_init, _, _ = generate_test_problem_from_algorithm4(
+        n=n, 
+        m=m, 
+        cardinality=int(0.1 * n), 
+        seed=seed
+    )
+    
+    run_dict = {}
+    fw_x = None  # Store FW solution for use by other algorithms
+    
+    # -- 2) Continuous Frank–Wolfe --
+    if "fw" in algorithms:
+        reset_min_eig_gradient_cache()
+        start_fw = time.time()
+        fw_x, fw_obj, fw_iters, fw_log = frank_wolfe_optimization(
+            obj_func=min_eigenvalue_objective,
+            obj_grad=min_eigenvalue_gradient,
+            selection_init=selection_init,
+            A=A_ineq,
+            b=b_ineq,
+            inf_mats=inf_mats,
+            H0=H0,
+            max_iterations=1000,
+            min_iterations=2,
+            convergence_tol=2e-2,
+            verbose=verbose,
+            check_final_stationarity=False
+        )
+        end_fw = time.time()
+        
+        # Compute & print variance info, store as JSON
+        fw_variance_info = compute_variance_info(A_ineq, fw_x)
+        
+        run_dict["continuous_relaxation"] = {
+            "obj": float(fw_obj),
+            "time": end_fw - start_fw,
+            "iterations": fw_iters,
+            "selection": fw_x.tolist(),
+            "variance_info": fw_variance_info  # store the list of dicts
+        }
+    
+    # -- 3) Randomized Rounding --
+    if "rounding" in algorithms:
+        if fw_x is None and "fw" not in algorithms:
+            if verbose:
+                print("Warning: Randomized rounding requested but Frank-Wolfe not run.")
+                print("Using initial selection as input to rounding.")
+            continuous_solution = selection_init
+        else:
+            continuous_solution = fw_x
+            
+        start_rr = time.time()
+        rr_x, rr_obj = round_solution(
+            cont_sol=continuous_solution,
+            inf_mats=inf_mats,
+            H0=H0,
+            A=A_ineq,
+            b=b_ineq,
+            obj_func=min_eigenvalue_objective,
+            num_samples=100,
+            verbose=verbose
+        )
+        end_rr = time.time()
+        
+        rr_variance_info = compute_variance_info(A_ineq, rr_x)
+        
+        run_dict["randomized_rounding"] = {
+            "obj": float(rr_obj),
+            "time": end_rr - start_rr,
+            "selection": rr_x.tolist(),
+            "variance_info": rr_variance_info
+        }
+        
+    # -- 3b) Contention Resolution Rounding --
+    if "cr" in algorithms:
+        if fw_x is None and "fw" not in algorithms:
+            if verbose:
+                print("Warning: Contention resolution requested but Frank-Wolfe not run.")
+                print("Using initial selection as input to contention resolution.")
+            continuous_solution = selection_init
+        else:
+            continuous_solution = fw_x
+            
+        start_cr = time.time()
+        cr_x, cr_obj = round_solution_with_cr(
+            cont_sol=continuous_solution,
+            inf_mats=inf_mats,
+            H0=H0,
+            A=A_ineq,
+            b=b_ineq,
+            obj_func=min_eigenvalue_objective,
+            num_samples=10,  # Number of CR rounding attempts
+            verbose=verbose
+        )
+        end_cr = time.time()
+        
+        cr_variance_info = compute_variance_info(A_ineq, cr_x)
+        
+        run_dict["contention_resolution"] = {
+            "obj": float(cr_obj),
+            "time": end_cr - start_cr,
+            "selection": cr_x.tolist(),
+            "variance_info": cr_variance_info
+        }
+    
+    # -- 4) Greedy Algorithm --
+    if "greedy" in algorithms:
+        start_greedy = time.time()
+        
+        # Define objective function for greedy algorithm
+        def objective_function(selected_indices):
+            if not selected_indices:
+                return min_eigenvalue_objective(np.zeros(n), inf_mats, H0)
+            
+            selection = np.zeros(n, dtype=int)
+            for idx in selected_indices:
+                selection[idx] = 1
+            return min_eigenvalue_objective(selection, inf_mats, H0)
+        
+        ground_set = list(range(n))
+        greedy_selection, greedy_obj, greedy_stats = greedy_algorithm_2(
+            ground_set=ground_set,
+            f=objective_function,
+            A=A_ineq,
+            b=b_ineq,
+            verbose=verbose,
+            timeout=time_limit
+        )
+        
+        # Convert greedy selection to binary vector
+        greedy_x = np.zeros(n, dtype=int)
+        for idx in greedy_selection:
+            greedy_x[idx] = 1
+        
+        end_greedy = time.time()
+        
+        greedy_variance_info = compute_variance_info(A_ineq, greedy_x)
+        
+        run_dict["greedy"] = {
+            "obj": float(greedy_obj),
+            "time": end_greedy - start_greedy,
+            "iterations": greedy_stats["iterations"],
+            "obj_evaluations": greedy_stats["obj_evaluations"],
+            "selection": greedy_x.tolist(),
+            "variance_info": greedy_variance_info
+        }
+    
+    # -- 5) Gurobi Branch & Cut --
+    if "gurobi" in algorithms:
+        try:
+            start_bc = time.time()
+            gurobi_x, gurobi_obj, gurobi_stats = branch_and_cut_gurobi(
+                inf_mats=inf_mats,
+                H0=H0,
+                A=A_ineq,
+                b=b_ineq,
+                time_limit=time_limit,
+                verbose=verbose,
+                cont_solution=fw_x if fw_x is not None else None
+            )
+            end_bc = time.time()
+            
+            if gurobi_x is None:
+                run_dict["gurobi"] = {
+                    "obj": float('-inf'),
+                    "time": end_bc - start_bc,
+                    "stats": {"status": "GUROBI_FAILED"},
+                    "selection": [],
+                    "variance_info": []
+                }
+            else:
+                gurobi_variance_info = compute_variance_info(A_ineq, gurobi_x)
+                
+                # Convert stats
+                gurobi_stats_serial = {
+                    k: float(v) if isinstance(v, (int, float, np.float64)) else v
+                    for k, v in gurobi_stats.items()
+                }
+                run_dict["gurobi"] = {
+                    "obj": float(gurobi_obj),
+                    "time": end_bc - start_bc,
+                    "stats": gurobi_stats_serial,
+                    "selection": gurobi_x.tolist(),
+                    "variance_info": gurobi_variance_info
+                }
+        except Exception as e:
+            if verbose:
+                print(f"Error running Gurobi: {str(e)}")
+            run_dict["gurobi"] = {
+                "obj": float('-inf'),
+                "time": 0.0,
+                "stats": {"status": f"ERROR: {str(e)}"},
+                "selection": [],
+                "variance_info": []
+            }
+    
+    return run_dict
 
+def aggregate_stats(runs_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Given a list of run dictionaries, compute aggregated statistics for each algorithm.
+    
+    Parameters:
+    -----------
+    runs_data : List[Dict[str, Any]]
+        List of dictionaries with results from each run
+    
+    Returns:
+    --------
+    Dict[str, Any]
+        Aggregated statistics
+    """
+    # Check which algorithms were run
+    available_algorithms = set()
+    for run_dict in runs_data:
+        available_algorithms.update(run_dict.keys())
+    
+    # Map of algorithm keys to their display names in stats
+    algorithm_keys = {
+        "continuous_relaxation": "continuous_relaxation",
+        "randomized_rounding": "randomized_rounding",
+        "contention_resolution": "contention_resolution",
+        "greedy": "greedy",
+        "gurobi": "gurobi"
+    }
+    
+    stats_block = {
+        "num_runs": len(runs_data),
+    }
+    
+    # For each available algorithm, compute statistics
+    for algo_key in available_algorithms:
+        # Skip if not a recognized algorithm
+        if algo_key not in algorithm_keys:
+            continue
+            
+        # Initialize collectors for metrics
+        objs = []
+        times = []
+        iterations = []
+        
+        # Collect data across all runs
+        for run_dict in runs_data:
+            if algo_key in run_dict:
+                algo_data = run_dict[algo_key]
+                objs.append(algo_data["obj"])
+                times.append(algo_data["time"])
+                if "iterations" in algo_data:
+                    iterations.append(algo_data["iterations"])
+        
+        # Skip if no data (algorithm wasn't run in any iteration)
+        if not objs:
+            continue
+            
+        def stats_1d(values):
+            d = {}
+            arr = [float(v) for v in values]
+            d["mean"] = float(np.mean(arr))
+            d["std"] = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+            d["min"] = float(np.min(arr))
+            d["max"] = float(np.max(arr))
+            return d
+        
+        # Calculate statistics
+        algo_stats = {
+            "obj_mean": stats_1d(objs)["mean"],
+            "obj_std":  stats_1d(objs)["std"],
+            "obj_min":  stats_1d(objs)["min"],
+            "obj_max":  stats_1d(objs)["max"],
+            "time_mean": stats_1d(times)["mean"],
+            "time_std":  stats_1d(times)["std"],
+        }
+        
+        # Add iteration stats if available
+        if iterations:
+            algo_stats.update({
+                "iterations_mean": stats_1d(iterations)["mean"],
+                "iterations_std":  stats_1d(iterations)["std"],
+            })
+        
+        # Store statistics
+        stats_block[algorithm_keys[algo_key]] = algo_stats
+    
+    return stats_block
 
 def run_experiments_for_n_m_pairs(
     n_values: List[int],
     m_values: List[int],
+    algorithms: List[str] = ["fw", "rounding", "cr", "greedy", "gurobi"],
     num_runs: int = 10,
     time_limit: Optional[float] = None,
-    verbose: bool = False
+    verbose: bool = True,
+    output_format: str = "json",
+    output_dir: str = "./"
 ):
     """
     For each (n, m) in the Cartesian product of n_values x m_values,
-    1) create a separate JSON file named f"results_n{n}_m{m}.json"
-    2) do 'num_runs' runs
-    3) aggregate stats
-    4) write final JSON with structure:
-        {
-          "runs": { "run_0": {...}, "run_1": {...}, ... },
-          "stats": {
-              "n": n,
-              "m": m,
-              "num_runs": num_runs,
-              "continuous_relaxation": {...},
-              "randomized_rounding":   {...},
-              "gurobi":                {...}
-          }
-        }
-    5) Finally, print a summary table for all pairs.
+    run experiments with selected algorithms.
+    
+    Parameters:
+    -----------
+    n_values : List[int]
+        List of n values to test
+    m_values : List[int]
+        List of m values to test
+    algorithms : List[str]
+        List of algorithms to run. Options include:
+        - "fw": Continuous Frank-Wolfe
+        - "rounding": Randomized Rounding
+        - "cr": Contention Resolution Rounding
+        - "greedy": Greedy Algorithm
+        - "gurobi": Gurobi Branch and Cut
+    num_runs : int
+        Number of runs for each (n, m) pair
+    time_limit : Optional[float]
+        Time limit for algorithms that support it
+    verbose : bool
+        Whether to print progress information
+    output_format : str
+        Output format. Options:
+        - "json": JSON files (one per n,m pair)
+        - "pickle": Pickle files (one per n,m pair)
+        - "hdf5": HDF5 file (all results in one file)
+    output_dir : str
+        Directory to save output files
     """
+    import os
+    import json
+    import pickle
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # For HDF5 format, we need to import h5py
+    h5_file = None
+    if output_format == "hdf5":
+        try:
+            import h5py
+            h5_file = h5py.File(os.path.join(output_dir, f"results_{time.strftime('%Y%m%d_%H%M%S')}.h5"), "w")
+        except ImportError:
+            print("h5py not available. Falling back to JSON format.")
+            output_format = "json"
+    
+    # Algorithm display names for summary table
+    algo_display = {
+        "fw": "FW",
+        "rounding": "RR",
+        "cr": "CR",
+        "greedy": "GRD", 
+        "gurobi": "GRB"
+    }
+    
+    # Algorithm keys in result dictionary
+    algo_keys = {
+        "fw": "continuous_relaxation",
+        "rounding": "randomized_rounding",
+        "cr": "contention_resolution",
+        "greedy": "greedy",
+        "gurobi": "gurobi"
+    }
     
     summary_results = [] 
     for n in n_values:
         for m in m_values:
+            if verbose:
+                print(f"\n=== Running experiments for n={n}, m={m} ===")
+                
             runs_data = []
             
-            # We might vary the seed each run, e.g., 0..4
+            # Run multiple experiments with different seeds
             for run_idx in range(num_runs):
                 seed = 1000 * (run_idx + 1)  # or any seed you like
-                print(f"\n=== (n={n}, m={m}) - Run {run_idx} with seed={seed} ===")
+                if verbose:
+                    print(f"\n=== (n={n}, m={m}) - Run {run_idx} with seed={seed} ===")
                 
                 run_result = run_single_experiment(
                     n=n,
                     m=m,
                     seed=seed,
+                    algorithms=algorithms,
                     time_limit=time_limit,
                     verbose=verbose
                 )
@@ -2065,6 +2652,13 @@ def run_experiments_for_n_m_pairs(
                 runs_out[f"run_{i}"] = rd
             
             output_dict = {
+                "params": {
+                    "n": n,
+                    "m": m,
+                    "algorithms": algorithms,
+                    "num_runs": num_runs,
+                    "time_limit": time_limit
+                },
                 "runs": runs_out,
                 "stats": {
                     "n": n,
@@ -2073,60 +2667,198 @@ def run_experiments_for_n_m_pairs(
                 }
             }
             
-            # Write to JSON file
-            filename = f"results_n{n}_m{m}.json"
-            with open(filename, "w") as f:
-                json.dump(output_dict, f, indent=2)
+            # Save results based on the selected format
+            if output_format == "json":
+                filename = os.path.join(output_dir, f"results_n{n}_m{m}.json")
+                with open(filename, "w") as f:
+                    json.dump(output_dict, f, indent=2)
+                if verbose:
+                    print(f"Saved results to {filename}")
             
-            print(f"Saved results for (n={n}, m={m}) to {filename}")
+            elif output_format == "pickle":
+                filename = os.path.join(output_dir, f"results_n{n}_m{m}.pkl")
+                with open(filename, "wb") as f:
+                    pickle.dump(output_dict, f)
+                if verbose:
+                    print(f"Saved results to {filename}")
             
-            # For summary table, just pick out a few items (e.g. mean objective/time)
-            summary_results.append({
+            elif output_format == "hdf5" and h5_file is not None:
+                # Create a group for this (n,m) pair
+                group_name = f"n{n}_m{m}"
+                group = h5_file.create_group(group_name)
+                
+                # Store parameters
+                param_group = group.create_group("params")
+                param_group.attrs["n"] = n
+                param_group.attrs["m"] = m
+                param_group.attrs["num_runs"] = num_runs
+                if time_limit is not None:
+                    param_group.attrs["time_limit"] = time_limit
+                
+                # Store algorithms as a dataset
+                param_group.create_dataset("algorithms", data=np.array(algorithms, dtype="S10"))
+                
+                # Store runs
+                runs_group = group.create_group("runs")
+                for i, run_data in enumerate(runs_data):
+                    run_group = runs_group.create_group(f"run_{i}")
+                    
+                    # Store data for each algorithm that was run
+                    for algo_name, algo_results in run_data.items():
+                        algo_group = run_group.create_group(algo_name)
+                        
+                        # Store scalar values directly as attributes
+                        for key, value in algo_results.items():
+                            if key not in ["selection", "variance_info", "stats"]:
+                                algo_group.attrs[key] = value
+                        
+                        # Store selection vector as dataset
+                        if "selection" in algo_results and algo_results["selection"]:
+                            algo_group.create_dataset("selection", data=np.array(algo_results["selection"]))
+                        
+                        # Store variance info as a group
+                        if "variance_info" in algo_results and algo_results["variance_info"]:
+                            var_group = algo_group.create_group("variance_info")
+                            for i, var_item in enumerate(algo_results["variance_info"]):
+                                item_group = var_group.create_group(f"item_{i}")
+                                for k, v in var_item.items():
+                                    item_group.attrs[k] = v
+                        
+                        # Store stats as attributes in a subgroup
+                        if "stats" in algo_results and algo_results["stats"]:
+                            stats_group = algo_group.create_group("stats")
+                            for k, v in algo_results["stats"].items():
+                                if isinstance(v, (int, float, str, bool)) or v is None:
+                                    stats_group.attrs[k] = v if v is not None else "None"
+                
+                # Store aggregated statistics
+                stats_group = group.create_group("stats")
+                stats_group.attrs["n"] = n
+                stats_group.attrs["m"] = m
+                stats_group.attrs["num_runs"] = stats_block["num_runs"]
+                
+                for algo_name, algo_stats in stats_block.items():
+                    if algo_name != "num_runs":
+                        algo_stats_group = stats_group.create_group(algo_name)
+                        for k, v in algo_stats.items():
+                            algo_stats_group.attrs[k] = v
+                
+                if verbose:
+                    print(f"Saved results for n={n}, m={m} to HDF5 file")
+            
+            # Build summary entry for this (n,m) pair
+            summary_entry = {
                 "n": n,
                 "m": m,
-                # continuous relaxation
-                "FW_obj_mean": stats_block["continuous_relaxation"]["obj_mean"],
-                "FW_time_mean": stats_block["continuous_relaxation"]["time_mean"],
-                # randomized rounding
-                "RR_obj_mean": stats_block["randomized_rounding"]["obj_mean"],
-                "RR_time_mean": stats_block["randomized_rounding"]["time_mean"],
-                # gurobi
-                "GRB_obj_mean": stats_block["gurobi"]["obj_mean"],
-                "GRB_time_mean": stats_block["gurobi"]["time_mean"],
-            })
+            }
+            
+            # Add metrics for each algorithm that was run
+            for algo in algorithms:
+                algo_key = algo_keys.get(algo)
+                if algo_key in stats_block:
+                    algo_disp = algo_display.get(algo, algo[:3].upper())
+                    summary_entry[f"{algo_disp}_obj"] = stats_block[algo_key]["obj_mean"]
+                    summary_entry[f"{algo_disp}_time"] = stats_block[algo_key]["time_mean"]
+            
+            summary_results.append(summary_entry)
     
+    # Close HDF5 file if it was created
+    if h5_file is not None:
+        h5_file.close()
+        
     # --- Print summary table for all (n,m) pairs ---
     print("\n\nFINAL SUMMARY TABLE")
-    print("-------------------------------------------------------------------------------------------")
-    header = (
-        f"{'n':>6}  {'m':>6}  |"
-        f"{'FW_obj_mean':>12}  {'FW_time_mean':>12}  |"
-        f"{'RR_obj_mean':>12}  {'RR_time_mean':>12}  |"
-        f"{'GRB_obj_mean':>12}  {'GRB_time_mean':>12}"
-    )
+    print("-" * 160)
+    
+    # Build header based on which algorithms were run
+    header = f"{'n':>6}  {'m':>6}"
+    for algo in algorithms:
+        algo_disp = algo_display.get(algo, algo[:3].upper())
+        header += f" |  {algo_disp+'_obj':>10}  {algo_disp+'_time':>10}"
+    
     print(header)
-    print("-------------------------------------------------------------------------------------------")
+    print("-" * 160)
+    
+    # Print each row
     for row in summary_results:
-        print(
-            f"{row['n']:6d}  {row['m']:6d}  |"
-            f"{row['FW_obj_mean']:12.4f}  {row['FW_time_mean']:12.2f}  |"
-            f"{row['RR_obj_mean']:12.4f}  {row['RR_time_mean']:12.2f}  |"
-            f"{row['GRB_obj_mean']:12.4f}  {row['GRB_time_mean']:12.2f}"
-        )
-    print("-------------------------------------------------------------------------------------------")
+        row_str = f"{row['n']:6d}  {row['m']:6d}"
+        
+        for algo in algorithms:
+            algo_disp = algo_display.get(algo, algo[:3].upper())
+            obj_key = f"{algo_disp}_obj"
+            time_key = f"{algo_disp}_time"
+            
+            if obj_key in row and time_key in row:
+                row_str += f" |  {row[obj_key]:10.4f}  {row[time_key]:10.2f}"
+            else:
+                row_str += f" |  {'N/A':>10}  {'N/A':>10}"
+        
+        print(row_str)
+    
+    print("-" * 80)
 
 def main():
-    logging.basicConfig(level=logging.INFO)
-
-    n_values = [15000, 20000, 25000, 30000]
-    m_values = [10000]
+    import argparse
+    import sys
     
+    parser = argparse.ArgumentParser(description='Run optimization experiments with multiple algorithms.')
+    
+    # Problem parameters
+    parser.add_argument('--n', type=int, nargs='+', default=[100], 
+                        help='List of n values (problem dimension)')
+    parser.add_argument('--m', type=int, nargs='+', default=[100], 
+                        help='List of m values (constraint dimension)')
+    
+    # Algorithm selection
+    parser.add_argument('--algorithms', type=str, nargs='+', default=['fw', 'rounding', 'cr', 'greedy'], 
+                        choices=['fw', 'rounding', 'cr', 'greedy', 'gurobi', 'all'],
+                        help='Algorithms to run (use "all" for all algorithms)')
+    
+    # Experiment parameters
+    parser.add_argument('--runs', type=int, default=1, 
+                        help='Number of runs per (n,m) pair')
+    parser.add_argument('--time-limit', type=float, default=None, 
+                        help='Time limit for algorithms in seconds')
+    parser.add_argument('--verbose', action='store_true', 
+                        help='Enable verbose output')
+    
+    # Output options
+    parser.add_argument('--output-format', type=str, default='json', 
+                        choices=['json', 'pickle', 'hdf5'],
+                        help='Output file format')
+    parser.add_argument('--output-dir', type=str, default='./', 
+                        help='Directory to save results')
+    
+    # Parse arguments
+    args = parser.parse_args()
+    
+    # Process 'all' algorithms choice
+    if 'all' in args.algorithms:
+        algorithms = ['fw', 'rounding', 'cr', 'greedy', 'gurobi']
+    else:
+        algorithms = args.algorithms
+    
+    # Check for dependency between rounding algorithms and fw
+    if ('rounding' in algorithms or 'cr' in algorithms) and 'fw' not in algorithms:
+        print("Warning: Rounding methods (randomized or contention resolution) typically need Frank-Wolfe results.")
+        print("Would you like to add Frank-Wolfe to the algorithms? (y/n)")
+        response = input().lower()
+        if response == 'y' or response == 'yes':
+            algorithms = ['fw'] + algorithms
+        else:
+            print("Continuing with rounding without Frank-Wolfe.")
+            print("Initial selection will be used for rounding.")
+    
+    # Run experiments
     run_experiments_for_n_m_pairs(
-        n_values=n_values,
-        m_values=m_values,
-        num_runs=1,
-        time_limit=None,   # pass a time limit if desired, e.g. 600 for 10 minutes
-        verbose=False
+        n_values=args.n,
+        m_values=args.m,
+        algorithms=algorithms,
+        num_runs=args.runs,
+        time_limit=args.time_limit,
+        verbose=args.verbose,
+        output_format=args.output_format,
+        output_dir=args.output_dir
     )
 
 if __name__ == "__main__":
