@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import os
 
 # Import your core functions from test_space (assumed to be in the same folder)
-import test_space
+import optimization_methods
 
 # Configure logging
 logging.basicConfig(
@@ -41,7 +41,7 @@ all_results = {}
 for n in n_values:
     for m in m_values:
         logger.info(f"Running experiment for n = {n}, m = {m}")
-        results = test_space.run_algorithm4_example(verbose=True, n=n, m=m, gamma=gamma_value)
+        results = optimization_methods.run_algorithm4_example(verbose=True, n=n, m=m, gamma=gamma_value)
         key = f"n_{n}_m_{m}"
         all_results[key] = results
         # Save results incrementally
