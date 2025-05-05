@@ -259,6 +259,7 @@ def step_size_lipschitz(
     
     logger.debug(f"Lipschitz-based step size: {step_size:.6f}")
     return step_size
+
 # ======================================================================
 # Linear Minimization Oracle (LMO)
 # ======================================================================
@@ -716,7 +717,7 @@ def min_eigenvalue_objective(
 
 def min_eigenvalue_gradient(
     x: np.ndarray, 
-    inf_mats: list,         # List of sparse matrices
+    inf_mats: list,
     H0: sp.spmatrix,
     skip_threshold: float = 1e-12,
     lobpcg_tol: float = 1e-4,
@@ -844,7 +845,7 @@ def branch_and_cut_gurobi(
     A: np.ndarray,
     b: np.ndarray,
     time_limit: int = 600,
-    mip_gap: float = 0.1,
+    mip_gap: float = 0.0,
     verbose: bool = False,
     cont_solution: np.ndarray = None
 ) -> Tuple[np.ndarray, float, Dict[str, Any]]:
@@ -1907,13 +1908,13 @@ def generate_test_problem_from_algorithm4(
     # Total Weight Constraint: sum(w_i * x_i) <= max_weight
     weights = np.random.uniform(1, 5, size=n)
     A_weight = weights.reshape(1, -1)
-    max_weight = 100
+    max_weight = 10
     b_weight = np.array([max_weight])
     
     # Total Cost Constraint: sum(c_i * x_i) <= max_cost
     costs = np.random.uniform(10, 20, size=n)
     A_cost = costs.reshape(1, -1)
-    max_cost = 1000
+    max_cost = 100
     b_cost = np.array([max_cost])
     
     # Stack all constraints together
@@ -2414,7 +2415,7 @@ def run_single_experiment(
                 H0=H0,
                 A=A_ineq,
                 b=b_ineq,
-                time_limit=time_limit,
+                time_limit=3600,
                 verbose=verbose,
                 cont_solution=fw_x if fw_x is not None else None
             )
