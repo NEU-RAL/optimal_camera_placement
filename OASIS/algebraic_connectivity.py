@@ -57,6 +57,8 @@ logger = logging.getLogger("test_algebraic_connectivity")
 # ───────────────────────────────────────────────────────────────────────────────
 # Data structures
 # ───────────────────────────────────────────────────────────────────────────────
+
+
 class Edge:
     """Simple weighted edge container."""
 
@@ -70,61 +72,64 @@ class Edge:
 # ───────────────────────────────────────────────────────────────────────────────
 # Linear‑algebra utilities
 # ───────────────────────────────────────────────────────────────────────────────
-#REPLACE THIS
-# def combined_laplacian(
-#     w: np.ndarray,
-#     L_base: sp.spmatrix,
-#     laplacian_e_list: List[sp.spmatrix],
-#     tol: float = 1e-10,
-# ) -> sp.spmatrix:
-#     """Return L_base + Σ_i w_i * L_i."""
-#     idx = np.where(w > tol)[0]
-#     if len(idx) == 0:
-#         return L_base.copy()
+# REPLACE THIS
+def combined_laplacian(
+    w: np.ndarray,
+    L_base: sp.spmatrix,
+    laplacian_e_list: List[sp.spmatrix],
+    tol: float = 1e-10,
+) -> sp.spmatrix:
+    """Return L_base + Σ_i w_i * L_i."""
+    idx = np.where(w > tol)[0]
+    if len(idx) == 0:
+        return L_base.copy()
 
-#     C = L_base.copy()
-#     for i in idx:
-#         C += w[i] * laplacian_e_list[i]
-#     return C
+    C = L_base.copy()
+    for i in idx:
+        C += w[i] * laplacian_e_list[i]
+    return C
 
-# def find_fiedler_pair(L: sp.spmatrix) -> Tuple[float, np.ndarray]:
-#     """Second smallest eigenpair of Laplacian."""
-#     try:
-#         vals, vecs = eigsh(L.tocsc(), k=2, which="SM", tol=1e-2)
-#         order = np.argsort(vals)
-#         return float(vals[order[1]]), vecs[:, order[1]]
-#     except Exception as exc: 
-#         logger.error("eigsh failed: %s", exc)
-#         return 0.0, np.zeros(L.shape[0])
+
+def find_fiedler_pair(L: sp.spmatrix) -> Tuple[float, np.ndarray]:
+    """Second smallest eigenpair of Laplacian."""
+    try:
+        vals, vecs = eigsh(L.tocsc(), k=2, which="SM", tol=1e-2)
+        order = np.argsort(vals)
+        return float(vals[order[1]]), vecs[:, order[1]]
+    except Exception as exc:
+        logger.error("eigsh failed: %s", exc)
+        return 0.0, np.zeros(L.shape[0])
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Objective & gradient
 # ───────────────────────────────────────────────────────────────────────────────
 # REPLACE THIS
-# def algebraic_connectivity_objective(
-#     w: np.ndarray,
-#     L_base: sp.spmatrix,
-#     laplacian_e_list: List[sp.spmatrix],
-# ) -> float:
-#     L = combined_laplacian(w, L_base, laplacian_e_list)
-#     fiedler_val, _ = find_fiedler_pair(L)
-#     return fiedler_val
 
 
-# def algebraic_connectivity_gradient(
-#     w: np.ndarray,
-#     L_base: sp.spmatrix,
-#     laplacian_e_list: List[sp.spmatrix],
-#     edge_list: List[Tuple[int, int]],
-#     weights: np.ndarray,
-# ) -> np.ndarray:
-#     L = combined_laplacian(w, L_base, laplacian_e_list)
-#     _, fiedler_vec = find_fiedler_pair(L)
+def algebraic_connectivity_objective(
+    w: np.ndarray,
+    L_base: sp.spmatrix,
+    laplacian_e_list: List[sp.spmatrix],
+) -> float:
+    L = combined_laplacian(w, L_base, laplacian_e_list)
+    fiedler_val, _ = find_fiedler_pair(L)
+    return fiedler_val
 
-#     grad = np.zeros_like(weights, dtype=float)
-#     for k, (i, j) in enumerate(edge_list):
-#         grad[k] = weights[k] * (fiedler_vec[i] - fiedler_vec[j]) ** 2
-#     return grad
+
+def algebraic_connectivity_gradient(
+    w: np.ndarray,
+    L_base: sp.spmatrix,
+    laplacian_e_list: List[sp.spmatrix],
+    edge_list: List[Tuple[int, int]],
+    weights: np.ndarray,
+) -> np.ndarray:
+    L = combined_laplacian(w, L_base, laplacian_e_list)
+    _, fiedler_vec = find_fiedler_pair(L)
+
+    grad = np.zeros_like(weights, dtype=float)
+    for k, (i, j) in enumerate(edge_list):
+        grad[k] = weights[k] * (fiedler_vec[i] - fiedler_vec[j]) ** 2
+    return grad
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -158,7 +163,8 @@ def setup_graph_problem(
         graph, _ = generate_3d_grid_graph(n_x, n_y, n_z, seed=seed)
 
         mst = nx.minimum_spanning_tree(graph)
-        odom_meas = [Edge(u, v, d.get("weight", 1.0)) for u, v, d in mst.edges(data=True)]
+        odom_meas = [Edge(u, v, d.get("weight", 1.0))
+                     for u, v, d in mst.edges(data=True)]
         lc_meas = [
             Edge(u, v, d.get("weight", 1.0))
             for u, v, d in graph.edges(data=True)
@@ -244,8 +250,10 @@ def run_experiments(
     edge_list = problem_setup["edge_list"]
     weights = problem_setup["weights"]
 
-    obj_func = lambda w: algebraic_connectivity_objective(w, L_base, lap_e_list)
-    grad_func = lambda w: algebraic_connectivity_gradient(
+    def obj_func(w): return algebraic_connectivity_objective(
+        w, L_base, lap_e_list)
+
+    def grad_func(w): return algebraic_connectivity_gradient(
         w, L_base, lap_e_list, edge_list, weights
     )
 
@@ -303,7 +311,8 @@ def run_experiments(
         logger.info("▶ Randomised rounding")
         t0 = time.time()
         rr_sol, rr_obj, rr_stats = randomized_rounding(
-            cont_sol=np.asarray(results["algorithms"]["frank_wolfe"]["solution"]),
+            cont_sol=np.asarray(
+                results["algorithms"]["frank_wolfe"]["solution"]),
             obj_func=obj_func,
             A=A,
             b=b,
@@ -327,7 +336,8 @@ def run_experiments(
         logger.info("▶ Contention‑resolution rounding")
         t0 = time.time()
         cr_sol, cr_obj, cr_stats = round_solution_with_cr(
-            cont_sol=np.asarray(results["algorithms"]["frank_wolfe"]["solution"]),
+            cont_sol=np.asarray(
+                results["algorithms"]["frank_wolfe"]["solution"]),
             obj_func=obj_func,
             A=A,
             b=b,
@@ -362,7 +372,8 @@ def run_experiments(
                 time_limit=time_limit,
                 verbose=True,
                 cont_solution=np.asarray(
-                    results["algorithms"].get("frank_wolfe", {}).get("solution")
+                    results["algorithms"].get(
+                        "frank_wolfe", {}).get("solution")
                 ),
             )
             results["algorithms"]["branch_and_cut"] = dict(
@@ -381,7 +392,8 @@ def run_experiments(
     for alg, res in sorted(
         results["algorithms"].items(), key=lambda x: x[1]["objective"], reverse=True
     ):
-        logger.info("%-25s %-15.8f %-15.2f", alg, res["objective"], res["runtime"])
+        logger.info("%-25s %-15.8f %-15.2f", alg,
+                    res["objective"], res["runtime"])
 
     # ── Persist results ───────────────────────────────────────────────────────
     if output_dir:
@@ -420,7 +432,8 @@ def plot_results(results: Dict[str, Any], out_html: str | None = None) -> None:
 
     if "frank_wolfe" in results["algorithms"]:
         fwlog = results["algorithms"]["frank_wolfe"]["log"]
-        fig.add_trace(go.Scatter(x=fwlog["iter"], y=fwlog["obj_val"]), row=2, col=1)
+        fig.add_trace(go.Scatter(
+            x=fwlog["iter"], y=fwlog["obj_val"]), row=2, col=1)
         fig.add_trace(
             go.Scatter(x=fwlog["iter"], y=fwlog["duality_gap"]), row=2, col=2
         )
@@ -573,11 +586,14 @@ def visualize_graph(
 # ───────────────────────────────────────────────────────────────────────────────
 # CLI
 # ───────────────────────────────────────────────────────────────────────────────
+
+
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser("Algebraic connectivity experiment")
-    parser.add_argument("--graph-type", choices=["pose_graph", "grid_3d", "sphere_3d"], default="pose_graph")
+    parser.add_argument(
+        "--graph-type", choices=["pose_graph", "grid_3d", "sphere_3d"], default="pose_graph")
     parser.add_argument("--graph-import", type=str)
     parser.add_argument("--num-poses", type=int, default=1000)
     parser.add_argument("--grid-size", type=int, nargs=3, default=[5, 5, 5])
@@ -601,7 +617,7 @@ def main() -> None:
     )
 
     os.makedirs(args.output, exist_ok=True)
-    
+
     problem = setup_graph_problem(
         graph_type=args.graph_type,
         graph_import=args.graph_import,
@@ -611,12 +627,14 @@ def main() -> None:
         selection_ratio=args.selection_ratio,
         seed=args.seed,
     )
-        
-    results = run_experiments(problem, algs, args.time_limit, output_dir=args.output)
+
+    results = run_experiments(
+        problem, algs, args.time_limit, output_dir=args.output)
     plot_results(results, out_html=os.path.join(args.output, "summary.html"))
 
     if args.visualize:
-        best_alg = max(results["algorithms"], key=lambda a: results["algorithms"][a]["objective"])
+        best_alg = max(
+            results["algorithms"], key=lambda a: results["algorithms"][a]["objective"])
         best_sol = np.asarray(results["algorithms"][best_alg]["solution"])
         viz_dir = os.path.join(args.output, "viz")
         os.makedirs(viz_dir, exist_ok=True)
@@ -627,6 +645,7 @@ def main() -> None:
             out_html=os.path.join(viz_dir, "graph.html"),
         )
         logger.info("Graph saved to %s", viz_dir)
+
 
 if __name__ == "__main__":
     main()
