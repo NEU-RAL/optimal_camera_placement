@@ -19,14 +19,18 @@ import time
 import logging
 from datetime import datetime
 from typing import List, Optional, Tuple, Dict, Any
-import numpy as np
-import scipy.sparse as sp
-from scipy.sparse.linalg import eigsh
 import networkx as nx
 import networkx.linalg as la
+import numpy as np
 import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
+import scipy.sparse as sp
+from scipy.sparse.linalg import eigsh
+from mac.solvers.greedy_eig import GreedyEig
+
+# custom mac imports
+from mac.utils.graphs import weight_graph_lap_from_edges
 from pose_graph_utils import read_g2o_file
 
 # Local modules
@@ -72,33 +76,7 @@ class Edge:
 # ───────────────────────────────────────────────────────────────────────────────
 # Linear‑algebra utilities
 # ───────────────────────────────────────────────────────────────────────────────
-# REPLACE THIS
-def combined_laplacian(
-    w: np.ndarray,
-    L_base: sp.spmatrix,
-    laplacian_e_list: List[sp.spmatrix],
-    tol: float = 1e-10,
-) -> sp.spmatrix:
-    """Return L_base + Σ_i w_i * L_i."""
-    idx = np.where(w > tol)[0]
-    if len(idx) == 0:
-        return L_base.copy()
 
-    C = L_base.copy()
-    for i in idx:
-        C += w[i] * laplacian_e_list[i]
-    return C
-
-
-def find_fiedler_pair(L: sp.spmatrix) -> Tuple[float, np.ndarray]:
-    """Second smallest eigenpair of Laplacian."""
-    try:
-        vals, vecs = eigsh(L.tocsc(), k=2, which="SM", tol=1e-2)
-        order = np.argsort(vals)
-        return float(vals[order[1]]), vecs[:, order[1]]
-    except Exception as exc:
-        logger.error("eigsh failed: %s", exc)
-        return 0.0, np.zeros(L.shape[0])
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Objective & gradient
@@ -108,27 +86,21 @@ def find_fiedler_pair(L: sp.spmatrix) -> Tuple[float, np.ndarray]:
 
 def algebraic_connectivity_objective(
     w: np.ndarray,
-    L_base: sp.spmatrix,
-    laplacian_e_list: List[sp.spmatrix],
+    solver: GreedyEig
 ) -> float:
-    L = combined_laplacian(w, L_base, laplacian_e_list)
-    fiedler_val, _ = find_fiedler_pair(L)
+    L = solver.combined_laplacian(w)
+    fiedler_val, _ = solver.find_fiedler_pair(L)
     return fiedler_val
 
 
 def algebraic_connectivity_gradient(
     w: np.ndarray,
-    L_base: sp.spmatrix,
-    laplacian_e_list: List[sp.spmatrix],
-    edge_list: List[Tuple[int, int]],
-    weights: np.ndarray,
+    solver: GreedyEig
 ) -> np.ndarray:
-    L = combined_laplacian(w, L_base, laplacian_e_list)
-    _, fiedler_vec = find_fiedler_pair(L)
+    L = solver.combined_laplacian(w)
+    _, fiedler_vec = solver.find_fiedler_pair(L)
+    grad = solver.grad_from_fiedler(fiedler_vec)
 
-    grad = np.zeros_like(weights, dtype=float)
-    for k, (i, j) in enumerate(edge_list):
-        grad[k] = weights[k] * (fiedler_vec[i] - fiedler_vec[j]) ** 2
     return grad
 
 
@@ -249,20 +221,24 @@ def run_experiments(
     lap_e_list = problem_setup["laplacian_e_list"]
     edge_list = problem_setup["edge_list"]
     weights = problem_setup["weights"]
+    num_poses = problem_setup["num_poses"]
+
+    solver: GreedyEig = GreedyEig(odom_measurements=problem_setup["odom_measurements"],
+                                  lc_measurements=problem_setup["lc_measurements"],
+                                  num_poses=num_poses)
 
     def obj_func(w): return algebraic_connectivity_objective(
-        w, L_base, lap_e_list)
+        w, solver)
 
     def grad_func(w): return algebraic_connectivity_gradient(
-        w, L_base, lap_e_list, edge_list, weights
-    )
+        w, solver)
 
     A, b = problem_setup["A"], problem_setup["b"]
 
     results: Dict[str, Any] = dict(
         problem=dict(
             graph_type=problem_setup["graph_type"],
-            num_poses=problem_setup["num_poses"],
+            num_poses=num_poses,
             num_loop_closures=n,
             k=problem_setup["k"],
         ),
