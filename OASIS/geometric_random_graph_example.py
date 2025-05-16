@@ -32,7 +32,7 @@ class NumpyEncoder(json.JSONEncoder):
 # Define arrays for n (number of matrices) and m (matrix sizes)
 n_values = [100]
 m_values = [100]
-gamma_value = 1.0  # Gamma parameter (for API compatibility)
+gamma_value = 1.0 
 
 # Dictionary to hold all experiment results
 all_results = {}

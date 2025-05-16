@@ -1,0 +1,8 @@
+Experiment Parameters:
+n (number of matrices): 10
+m (matrix dimension): 100
+k (cardinality constraint): 3
+Algorithms used: fw, greedy, rounding, cr, branch_and_cut
+Seed: 42
+Time limit: 300 seconds
+Timestamp: 2025-05-05 13:51:39

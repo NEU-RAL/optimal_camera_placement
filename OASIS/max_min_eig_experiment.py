@@ -1,15 +1,32 @@
-import numpy as np
-import scipy.sparse as sp
-from scipy.sparse.linalg import eigsh, lobpcg
-import time
-import matplotlib.pyplot as plt
-import logging
 import os
 import json
+import time
+import numpy as np
+import scipy.sparse as sp
+from scipy.sparse.linalg import eigsh, lobpcg, spilu
+import matplotlib.pyplot as plt
+import logging
+import argparse
 from datetime import datetime
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, NamedTuple
+import traceback
 
-# Create a NumPy-compatible JSON encoder
+# Import your modules
+from optimization_methods import (
+    frank_wolfe_optimization,
+    branch_and_cut_gurobi,
+    greedy_algorithm_2,
+    randomized_rounding,
+    algorithm_3_contention_resolution_rounding,
+    round_solution_with_cr,
+    compute_variance_info,
+    compute_suboptimality_bound
+)
+from graph_generation import generate_test_matrices, generate_test_problem_constraints
+from objectives import min_eig_gradient, min_eig_objective
+from fim_utils import precompute_fim_stack, combined_fim
+
+# NumPy-compatible JSON encoder
 class NumpyEncoder(json.JSONEncoder):
     """Custom JSON encoder for NumPy types"""
     def default(self, obj):
@@ -23,150 +40,72 @@ class NumpyEncoder(json.JSONEncoder):
             return bool(obj)
         return super(NumpyEncoder, self).default(obj)
 
-"""
-Test script for minimum eigenvalue maximization problem.
-
-This script defines the objective function and gradient for maximizing
-the minimum eigenvalue of a weighted sum of matrices, then solves the
-optimization problem using various methods.
-"""
-from optimization_methods import (
-    frank_wolfe_optimization,
-    branch_and_cut_gurobi,
-    greedy_algorithm_2,
-    randomized_rounding,
-    algorithm_3_contention_resolution_rounding,
-    round_solution_with_cr,
-    compute_variance_info,
-    compute_suboptimality_bound
-)
-from graph_generation import generate_test_matrices, generate_test_problem_constraints
-
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("test_min_eigenvalue")
-
-# ======================================================================
-# Objective Function and Gradient Definitions
-# ======================================================================
-
-def min_eigenvalue_objective(
-    x: np.ndarray, 
-    inf_mats: List[sp.spmatrix], 
-    H0: sp.spmatrix
-) -> float:
+def prepare_cache_from_quadruplets(quadruplets, prior_quads, matrix_size):
     """
-    Compute the minimum eigenvalue of the sum of selected matrices.
-    
-    Args:
-        x: Selection vector
-        inf_mats: List of information matrices
-        H0: Prior information matrix
-        
-    Returns:
-        float: Minimum eigenvalue
+    Prepare a cache dictionary from quadruplet lists for use with min_eig functions.
     """
-    combined_fim = H0.copy()
-    for xi, Hi in zip(x, inf_mats):
-        combined_fim += xi * Hi
+    # Extract components from quadruplets
+    rows = []
+    cols = []
+    data0 = []
+    owner = []
     
-    # Add small regularization for numerical stability
-    combined_fim += 1e-10 * sp.eye(combined_fim.shape[0])
+    # Process regular quadruplets
+    for q in quadruplets:
+        rows.append(q.row)
+        cols.append(q.col)
+        data0.append(q.value)
+        owner.append(q.matrix_idx)
     
-    try:
-        min_eig_val, _ = eigsh(combined_fim.tocsc(), k=1, which='SA', tol=1e-2, ncv=40)
-        return float(min_eig_val[0])
-    except Exception as e:
-        logger.error(f"Error computing eigenvalues: {str(e)}")
-        # Return a very negative value to indicate failure
-        return -1e10
-
-def min_eigenvalue_gradient(
-    x: np.ndarray, 
-    inf_mats: list,
-    H0: sp.spmatrix,
-) -> np.ndarray:
-    """
-    Compute the gradient of the minimum eigenvalue objective.
+    # Convert to arrays
+    rows = np.array(rows)
+    cols = np.array(cols)
+    data0 = np.array(data0)
+    owner = np.array(owner)
     
-    Args:
-        x: Selection vector
-        inf_mats: List of information matrices
-        H0: Prior information matrix
-        
-    Returns:
-        np.ndarray: Gradient vector
-    """
-    # Cache for matrix in CSC format (if needed for repeat evaluations)
-    if not hasattr(min_eigenvalue_gradient, "cached_inf_mats"):
-        min_eigenvalue_gradient.cached_inf_mats = [
-            Hi.tocsc() if not sp.isspmatrix_csc(Hi) else Hi
-            for Hi in inf_mats
-        ]
-        
-    # Compute the combined matrix
-    combined_fim = H0.copy()
-    for xi, Hi in zip(x, inf_mats):
-        combined_fim += xi * Hi
+    # Create pattern matrix
+    pattern = sp.csc_matrix((np.ones_like(data0), (rows, cols)), shape=(matrix_size, matrix_size))
     
-    # Compute eigenvector corresponding to minimum eigenvalue
-    min_eig_val, min_eig_vec = eigsh(combined_fim.tocsc(), k=1, which='SA', tol=1e-4)
-    min_eig_vec = min_eig_vec.flatten()
+    # Create H0 from prior quadruplets
+    H0_rows = [q.row for q in prior_quads]
+    H0_cols = [q.col for q in prior_quads]
+    H0_data = [q.value for q in prior_quads]
+    H0 = sp.csc_matrix((H0_data, (H0_rows, H0_cols)), shape=(matrix_size, matrix_size))
     
-    # Compute gradient components
-    grad = np.zeros(len(inf_mats))
-    for i, Hi in enumerate(inf_mats):
-        temp = Hi.dot(min_eig_vec)
-        grad[i] = float(min_eig_vec.dot(temp))
+    # Create cache dictionary
+    cache = {
+        "pattern": pattern,
+        "data0": data0,
+        "owner": owner,
+        "rows": rows,
+        "cols": cols,
+        "H0": H0,
+        "shape": (matrix_size, matrix_size)
+    }
     
-    return grad
-
-def reset_min_eig_gradient_cache():
-    """
-    Clears the cached attributes in min_eigenvalue_gradient
-    """
-    cache_attrs = [
-        "cached_inf_mats",
-    ]
-    for attr in cache_attrs:
-        if hasattr(min_eigenvalue_gradient, attr):
-            delattr(min_eigenvalue_gradient, attr)
-
-# ======================================================================
-# Experiment Utilities
-# ======================================================================
+    return cache
 
 def run_experiments(
-    n: int = 100,
-    m: int = 50,
-    k: int = 20,
-    algorithms: List[str] = ["fw", "greedy", "rounding", "cr"],
-    time_limit: int = 300,
-    seed: int = 42,
-    output_dir: str = None
+    n: int,
+    m: int,
+    k: int,
+    algorithms: List[str],
+    time_limit: int,
+    seed: int,
+    output_dir: str,
+    use_quadruplets: bool = True,
+    existing_fw_solution = None,
+    existing_fw_obj = None
 ) -> Dict[str, Any]:
     """
     Run optimization experiments with multiple algorithms.
-    
-    Args:
-        n: Number of matrices to choose from
-        m: Size of each matrix
-        k: Cardinality constraint (number of matrices to select)
-        algorithms: List of algorithms to run
-        time_limit: Time limit in seconds for exact methods
-        seed: Random seed
-        output_dir: Directory to save results and plots
-        
-    Returns:
-        Dict with experiment results
     """
-    logger.info(f"Generating problem instance n={n}, m={m}, k={k}")
+    logger = logging.getLogger("experiment")
+    logger.info(f"Generating problem instance n={n}, m={m}, k={k}, seed={seed}")
     
     # Generate test matrices
-    inf_mats, H0, weights = generate_test_matrices(n=n, m=m, seed=seed)
+    quadruplets, prior_quads, weights = generate_test_matrices(n=n, m=m, seed=seed)
+    cache = prepare_cache_from_quadruplets(quadruplets, prior_quads, m)
     
     # Generate constraints
     A, b = generate_test_problem_constraints(n, weights, k)
@@ -177,13 +116,29 @@ def run_experiments(
             "n": n,
             "m": m,
             "k": k,
-            "seed": seed
+            "seed": seed,
+            "representation": "quadruplets" if use_quadruplets else "sparse_matrices"
         },
         "algorithms": {}
     }
     
     # Initial solution (all zeros)
     selection_init = np.zeros(n)
+    
+    # Wrapper functions to use the cache
+    def obj_func_wrapper(x, *args):
+        if not isinstance(x, np.ndarray):
+            x = np.array(x)
+        return min_eig_objective(x, cache)
+    
+    def grad_func_wrapper(x, *args):
+        if not isinstance(x, np.ndarray):
+            x = np.array(x)
+        return min_eig_gradient(x, cache)
+    
+    # Use existing FW solution if provided
+    fw_solution = None
+    fw_obj = None
     
     # ======================================================================
     # 1. Frank-Wolfe Algorithm
@@ -192,18 +147,16 @@ def run_experiments(
         logger.info("Running Frank-Wolfe algorithm...")
         start_time = time.time()
         
-        reset_min_eig_gradient_cache()
         fw_solution, fw_obj, fw_iters, fw_log = frank_wolfe_optimization(
-            obj_func=min_eigenvalue_objective,
-            obj_grad=min_eigenvalue_gradient,
+            obj_func=obj_func_wrapper,
+            obj_grad=grad_func_wrapper,
             selection_init=selection_init,
             A=A,
             b=b,
             max_iterations=1000,
             convergence_tol=1e-3,
-            step_size_strategy="diminishing",
             verbose=True,
-            args=(inf_mats, H0)
+            args=()  # No extra args needed with the cache
         )
         
         fw_time = time.time() - start_time
@@ -217,6 +170,10 @@ def run_experiments(
         }
         
         logger.info(f"Frank-Wolfe complete: obj={fw_obj:.6f}, time={fw_time:.2f}s")
+    elif existing_fw_solution is not None and existing_fw_obj is not None:
+        # Use provided FW solution
+        fw_solution = existing_fw_solution
+        fw_obj = existing_fw_obj
     
     # ======================================================================
     # 2. Greedy Algorithm
@@ -226,13 +183,13 @@ def run_experiments(
         start_time = time.time()
         
         greedy_solution, greedy_obj, greedy_stats = greedy_algorithm_2(
-            obj_func=min_eigenvalue_objective,
+            obj_func=obj_func_wrapper,
             A=A,
             b=b,
             n=n,
             verbose=True,
             timeout=time_limit,
-            args=(inf_mats, H0)
+            args=()  # No extra args needed
         )
         
         greedy_time = time.time() - start_time
@@ -244,7 +201,8 @@ def run_experiments(
             "stats": {
                 "iterations": greedy_stats["iterations"],
                 "obj_evaluations": greedy_stats["obj_evaluations"],
-                "selected_count": greedy_stats["selected_count"]
+                "selected_count": greedy_stats["selected_count"],
+                "time_per_iter": greedy_stats.get("time_per_iter", [])
             }
         }
         
@@ -253,18 +211,18 @@ def run_experiments(
     # ======================================================================
     # 3. Randomized Rounding
     # ======================================================================
-    if "rounding" in algorithms and "fw" in algorithms:
+    if "rounding" in algorithms and fw_solution is not None:
         logger.info("Running Randomized Rounding...")
         start_time = time.time()
         
         rr_solution, rr_obj, rr_stats = randomized_rounding(
             cont_sol=fw_solution,
-            obj_func=min_eigenvalue_objective,
+            obj_func=obj_func_wrapper,
             A=A,
             b=b,
             num_samples=100,
             verbose=True,
-            args=(inf_mats, H0)
+            args=()  # No extra args needed
         )
         
         rr_time = time.time() - start_time
@@ -291,18 +249,18 @@ def run_experiments(
     # ======================================================================
     # 4. Contention Resolution Rounding
     # ======================================================================
-    if "cr" in algorithms and "fw" in algorithms:
+    if "cr" in algorithms and fw_solution is not None:
         logger.info("Running Contention Resolution Rounding...")
         start_time = time.time()
         
         cr_solution, cr_obj, cr_stats = round_solution_with_cr(
             cont_sol=fw_solution,
-            obj_func=min_eigenvalue_objective,
+            obj_func=obj_func_wrapper,
             A=A,
             b=b,
             num_samples=10,
             verbose=True,
-            args=(inf_mats, H0)
+            args=()  # No extra args needed
         )
         
         cr_time = time.time() - start_time
@@ -335,15 +293,15 @@ def run_experiments(
             start_time = time.time()
             
             bc_solution, bc_obj, bc_stats = branch_and_cut_gurobi(
-                obj_func=min_eigenvalue_objective,
-                obj_grad=min_eigenvalue_gradient,
+                obj_func=obj_func_wrapper,
+                obj_grad=grad_func_wrapper,
                 A=A,
                 b=b,
                 n=n,
                 time_limit=time_limit,
                 verbose=True,
-                cont_solution=fw_solution if "fw" in algorithms else None,
-                args=(inf_mats, H0)
+                cont_solution=fw_solution if fw_solution is not None else None,
+                args=()  # No extra args needed
             )
             
             bc_time = time.time() - start_time
@@ -362,172 +320,276 @@ def run_experiments(
             logger.info(f"Branch and Cut complete: obj={bc_obj:.6f}, time={bc_time:.2f}s")
         except ImportError:
             logger.warning("Gurobi not available, skipping Branch and Cut")
+        except Exception as e:
+            logger.error(f"Error running Branch and Cut: {e}")
+            traceback.print_exc()
+
+    # Generate summary table
+    generate_summary_table(results, logger)
     
-    # ======================================================================
-    # Compare Results
-    # ======================================================================
-    logger.info("\nResults Summary:")
-    
-    # Create a summary table
-    summary = []
-    for alg_name, alg_results in results["algorithms"].items():
-        summary.append({
-            "algorithm": alg_name,
-            "objective": alg_results["objective"],
-            "runtime": alg_results["runtime"]
-        })
-    
-    # Sort by objective value (descending)
-    summary.sort(key=lambda x: x["objective"], reverse=True)
-    
-    # Print summary
-    logger.info(f"{'Algorithm':<25} {'Objective':<15} {'Runtime (s)':<15}")
-    logger.info("-" * 55)
-    for item in summary:
-        logger.info(f"{item['algorithm']:<25} {item['objective']:<15.6f} {item['runtime']:<15.2f}")
-    
-    # Save results if output directory is specified
-    if output_dir is not None:
-        # Create a timestamp for folder name (to the minute)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-        
-        # Create a folder with timestamp
-        result_dir = os.path.join(output_dir, f"experiment_{timestamp}")
-        os.makedirs(result_dir, exist_ok=True)
-        
-        # Save results to JSON
-        results_file = os.path.join(result_dir, "results.json")
-        
-        # Create a serializable copy of results (excluding sparse matrices)
-        serializable_results = results.copy()
-        
-        # Save to JSON with NumPy encoder
+    # Save results to file if output directory is specified
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        results_file = os.path.join(output_dir, "results.json")
         with open(results_file, 'w') as f:
-            json.dump(serializable_results, f, indent=2, cls=NumpyEncoder)
-        
-        # Save parameter summary
-        params_file = os.path.join(result_dir, "parameters.txt")
-        with open(params_file, 'w') as f:
-            f.write(f"Experiment Parameters:\n")
-            f.write(f"n (number of matrices): {n}\n")
-            f.write(f"m (matrix dimension): {m}\n")
-            f.write(f"k (cardinality constraint): {k}\n")
-            f.write(f"Algorithms used: {', '.join(algorithms)}\n")
-            f.write(f"Seed: {seed}\n")
-            f.write(f"Time limit: {time_limit} seconds\n")
-            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        
-        # Save plots
-        plot_results(results, os.path.join(result_dir, "summary_plots.png"))
-        
-        logger.info(f"Results saved to directory: {result_dir}")
+            json.dump(results, f, cls=NumpyEncoder, indent=2)
+        logger.info(f"Results saved to {results_file}")
     
     return results
 
-def plot_results(results: Dict[str, Any], output_file: str = None):
-    """
-    Plot optimization results.
+def generate_summary_table(results, logger):
+    """Generate and log a summary table of results"""
+    logger.info("=" * 80)
+    logger.info("Summary of Results:")
+    logger.info("=" * 80)
     
-    Args:
-        results: Results dictionary from run_experiments
-        output_file: Optional file path to save the plot
-    """
-    plt.figure(figsize=(12, 10))
+    # Create format string for the table
+    header_format = "{:<20} {:<12} {:<12} {:<12} {:<12}"
+    row_format = "{:<20} {:<12.6f} {:<12.2f} {:<12.2%} {:<12}"
     
-    # Plot 1: Objective values comparison
-    plt.subplot(2, 2, 1)
-    algs = []
-    objs = []
+    # Print header
+    logger.info(header_format.format("Algorithm", "Objective", "Runtime (s)", "Gap to FW", "Selected"))
+    logger.info("-" * 80)
+    
+    # Get Frank-Wolfe objective for comparison if available
+    fw_obj = results["algorithms"].get("frank_wolfe", {}).get("objective", None)
+    
+    # Print each algorithm's results
     for alg_name, alg_results in results["algorithms"].items():
-        algs.append(alg_name)
-        objs.append(alg_results["objective"])
-    
-    plt.bar(algs, objs)
-    plt.title("Objective Value Comparison")
-    plt.ylabel("Minimum Eigenvalue")
-    plt.xticks(rotation=45)
-    
-    # Plot 2: Runtime comparison
-    plt.subplot(2, 2, 2)
-    algs = []
-    times = []
-    for alg_name, alg_results in results["algorithms"].items():
-        algs.append(alg_name)
-        times.append(alg_results["runtime"])
-    
-    plt.bar(algs, times)
-    plt.title("Runtime Comparison")
-    plt.ylabel("Time (seconds)")
-    plt.xticks(rotation=45)
-    
-    # Plot 3: Frank-Wolfe convergence
-    if "frank_wolfe" in results["algorithms"]:
-        plt.subplot(2, 2, 3)
-        fw_log = results["algorithms"]["frank_wolfe"]["log"]
-        plt.plot(fw_log["iter"], fw_log["obj_val"])
-        plt.title("Frank-Wolfe Convergence")
-        plt.xlabel("Iteration")
-        plt.ylabel("Objective Value")
-        plt.grid(True)
+        obj = alg_results["objective"]
+        runtime = alg_results["runtime"]
         
-        # Plot 4: Frank-Wolfe duality gap
-        plt.subplot(2, 2, 4)
-        plt.semilogy(fw_log["iter"], fw_log["duality_gap"])
-        plt.title("Frank-Wolfe Duality Gap")
-        plt.xlabel("Iteration")
-        plt.ylabel("Duality Gap (log scale)")
-        plt.grid(True)
+        # Calculate gap to FW (if FW was run)
+        if fw_obj is not None and alg_name != "frank_wolfe":
+            rel_gap = (fw_obj - obj) / fw_obj if fw_obj > 0 else float('inf')
+        else:
+            rel_gap = 0.0
+        
+        # Get number of selected elements if available
+        if "solution" in alg_results:
+            if isinstance(alg_results["solution"], list):
+                selected = sum(1 for x in alg_results["solution"] if x > 0.5)
+            else:
+                selected = sum(1 for x in alg_results["solution"] if x > 0.5)
+        else:
+            selected = "N/A"
+            
+        logger.info(row_format.format(alg_name, obj, runtime, rel_gap, selected))
     
-    plt.tight_layout()
+    logger.info("=" * 80)
     
-    if output_file:
-        plt.savefig(output_file)
-    else:
-        plt.show()
+    # Add the summary to the results dictionary
+    summary_table = []
+    for alg_name, alg_results in results["algorithms"].items():
+        obj = alg_results["objective"]
+        runtime = alg_results["runtime"]
+        
+        if fw_obj is not None and alg_name != "frank_wolfe":
+            rel_gap = (fw_obj - obj) / fw_obj if fw_obj > 0 else float('inf')
+        else:
+            rel_gap = 0.0
+            
+        if "solution" in alg_results:
+            if isinstance(alg_results["solution"], list):
+                selected = sum(1 for x in alg_results["solution"] if x > 0.5)
+            else:
+                selected = sum(1 for x in alg_results["solution"] if x > 0.5)
+        else:
+            selected = None
+            
+        summary_table.append({
+            "algorithm": alg_name,
+            "objective": obj,
+            "runtime": runtime,
+            "gap_to_fw": rel_gap,
+            "selected": selected
+        })
+    
+    results["summary"] = summary_table
 
-# ======================================================================
-# Main function
-# ======================================================================
-
-def main():
-    """
-    Main function to run the experiments.
-    """
-    import argparse
+def run_experiment_series():
+    """Run a series of experiments with varying parameters"""
+    # Parameter ranges
+    m_values = [5000, 10000, 25000, 50000]
+    n_values = [100, 500, 1000, 5000, 10000, 25000, 50000]
+    k_fractions = [0.1, 0.2, 0.3, 0.4, 0.5]
+    seeds = [42, 13, 71, 999, 123]
     
-    parser = argparse.ArgumentParser(description='Run min eigenvalue maximization experiments')
-    parser.add_argument('--n', type=int, default=10, help='Number of matrices to choose from')
-    parser.add_argument('--m', type=int, default=100, help='Size of each matrix')
-    parser.add_argument('--k', type=int, default=3, help='Cardinality constraint')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--time-limit', type=int, default=300, help='Time limit in seconds')
-    parser.add_argument('--algorithms', nargs='+', default=['fw', 'greedy', 'rounding', 'cr', 'branch_and_cut'],
-                        choices=['fw', 'greedy', 'rounding', 'cr', 'branch_and_cut', 'all'],
-                        help='Algorithms to run')
-    parser.add_argument('--output', type=str, default='./results', help='Output directory for results and plots')
+    # All algorithms to run
+    all_algorithms = ['fw', 'greedy', 'rounding', 'cr', 'branch_and_cut']
     
-    args = parser.parse_args()
+    # Create a timestamped base directory for this run
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_output_dir = f"results/{timestamp}_experiment_series"
+    os.makedirs(base_output_dir, exist_ok=True)
     
-    # Process 'all' algorithms choice
-    if 'all' in args.algorithms:
-        algorithms = ['fw', 'greedy', 'rounding', 'cr', 'branch_and_cut']
-    else:
-        algorithms = args.algorithms
-    
-    # Create output directory if it doesn't exist
-    if args.output and not os.path.exists(args.output):
-        os.makedirs(args.output)
-    
-    # Run experiments
-    results = run_experiments(
-        n=args.n,
-        m=args.m,
-        k=args.k,
-        algorithms=algorithms,
-        time_limit=args.time_limit,
-        seed=args.seed,
-        output_dir=args.output
+    # Set up logging for the experiment series
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(f"{base_output_dir}/experiment_log.txt"),
+            logging.StreamHandler()
+        ]
     )
+    logger = logging.getLogger("experiment_series")
+    
+    # Results storage
+    all_results = []
+    
+    # Loop structure: m -> n -> k -> seed
+    for m in m_values:
+        for n in n_values:
+            # Skip if n > m as it doesn't make sense to have more matrices than matrix size
+            if n > m:
+                logger.info(f"Skipping configuration m={m}, n={n} as n > m")
+                continue
+                
+            for k_frac in k_fractions:
+                # Calculate actual k value as percentage of n
+                k = max(1, int(n * k_frac))
+                
+                for seed in seeds:
+                    # Create configuration identifier
+                    config_id = f"m{m}_n{n}_k{k}_seed{seed}"
+                    logger.info(f"\n\n{'='*80}")
+                    logger.info(f"EXPERIMENT: m={m}, n={n}, k={k} ({k_frac*100:.0f}% of n), seed={seed}")
+                    logger.info(f"{'='*80}\n")
+                    
+                    # Create directory for this specific configuration
+                    config_dir = f"{base_output_dir}/{config_id}"
+                    os.makedirs(config_dir, exist_ok=True)
+                    
+                    try:
+                        # Run FW first to determine timings for other algorithms
+                        logger.info("Running Frank-Wolfe to determine timings for other algorithms...")
+                        fw_result = run_experiments(
+                            n=n,
+                            m=m,
+                            k=k,
+                            algorithms=['fw'],
+                            time_limit=3600,  # 1 hour max for FW
+                            seed=seed,
+                            output_dir=os.path.join(config_dir, "fw"),
+                            use_quadruplets=True
+                        )
+                        
+                        # Extract FW runtime to set time limits for other algorithms
+                        fw_runtime = fw_result['algorithms']['frank_wolfe']['runtime']
+                        logger.info(f"FW runtime: {fw_runtime:.2f} seconds")
+                        
+                        # Extract FW solution and objective
+                        fw_solution = np.array(fw_result['algorithms']['frank_wolfe']['solution'])
+                        fw_obj = fw_result['algorithms']['frank_wolfe']['objective']
+                        
+                        # Set time limits for greedy and branch_and_cut (1000x FW with max 1 hour)
+                        greedy_time_limit = min(3600, max(300, int(fw_runtime * 1000)))
+                        branch_time_limit = min(3600, max(300, int(fw_runtime * 1000)))
+                        
+                        logger.info(f"Setting time limits: greedy={greedy_time_limit}s, branch_and_cut={branch_time_limit}s")
+                        
+                        # Run greedy algorithm
+                        logger.info("Running Greedy algorithm...")
+                        greedy_result = run_experiments(
+                            n=n,
+                            m=m,
+                            k=k,
+                            algorithms=['greedy'],
+                            time_limit=greedy_time_limit,
+                            seed=seed,
+                            output_dir=os.path.join(config_dir, "greedy"),
+                            use_quadruplets=True,
+                            existing_fw_solution=fw_solution,
+                            existing_fw_obj=fw_obj
+                        )
+                        
+                        # Run rounding algorithms
+                        logger.info("Running Rounding algorithms...")
+                        rounding_result = run_experiments(
+                            n=n,
+                            m=m,
+                            k=k,
+                            algorithms=['rounding', 'cr'],
+                            time_limit=300,  # These are usually quick
+                            seed=seed,
+                            output_dir=os.path.join(config_dir, "rounding"),
+                            use_quadruplets=True,
+                            existing_fw_solution=fw_solution,
+                            existing_fw_obj=fw_obj
+                        )
+                        
+                        # Run branch_and_cut
+                        logger.info("Running Branch and Cut...")
+                        bc_result = run_experiments(
+                            n=n,
+                            m=m,
+                            k=k,
+                            algorithms=['branch_and_cut'],
+                            time_limit=branch_time_limit,
+                            seed=seed,
+                            output_dir=os.path.join(config_dir, "branch_and_cut"),
+                            use_quadruplets=True,
+                            existing_fw_solution=fw_solution,
+                            existing_fw_obj=fw_obj
+                        )
+                        
+                        # Combine results from all algorithm runs
+                        combined_result = {
+                            'problem': fw_result['problem'],
+                            'algorithms': {
+                                **fw_result.get('algorithms', {}),
+                                **greedy_result.get('algorithms', {}),
+                                **rounding_result.get('algorithms', {}),
+                                **bc_result.get('algorithms', {})
+                            }
+                        }
+                        
+                        # Generate summary
+                        generate_summary_table(combined_result, logger)
+                        
+                        # Save combined result
+                        with open(f"{config_dir}/combined_results.json", 'w') as f:
+                            json.dump(combined_result, f, cls=NumpyEncoder, indent=2)
+                        
+                        # Add this experiment's summary to the overall results
+                        experiment_summary = {
+                            'm': m,
+                            'n': n,
+                            'k': k,
+                            'k_fraction': k_frac,
+                            'seed': seed
+                        }
+                        
+                        for summary in combined_result['summary']:
+                            alg = summary['algorithm']
+                            experiment_summary[f"{alg}_obj"] = summary['objective']
+                            experiment_summary[f"{alg}_time"] = summary['runtime']
+                            experiment_summary[f"{alg}_gap"] = summary['gap_to_fw']
+                            experiment_summary[f"{alg}_selected"] = summary['selected']
+                        
+                        all_results.append(experiment_summary)
+                        
+                        # Save updated consolidated results after each experiment
+                        with open(f"{base_output_dir}/all_experiments.json", 'w') as f:
+                            json.dump(all_results, f, cls=NumpyEncoder, indent=2)
+                        
+                    except Exception as e:
+                        logger.error(f"ERROR in experiment m={m}, n={n}, k={k}, seed={seed}: {e}", exc_info=True)
+                        # Log the error but continue with other experiments
+    
+    logger.info("Experiment series complete!")
+    return all_results
+
 
 if __name__ == "__main__":
-    main()
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Run optimization experiment series')
+    parser.add_argument('--subset', action='store_true', help='Run a smaller subset of experiments for testing')
+    args = parser.parse_args()
+    
+    try:
+            results = run_experiment_series()
+            print(f"Full experiment series completed successfully!")
+    except Exception as e:
+        print(f"Error in experiment series: {e}")
+        traceback.print_exc()

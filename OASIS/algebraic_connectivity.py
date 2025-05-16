@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """
 Test script for algebraic connectivity maximization.
-
-This script defines the objective function and gradient for maximizing the
-algebraic connectivity (second–smallest eigenvalue of the Laplacian) of a graph
-with edge selection, and compares several optimisation algorithms. 3‑D and 2‑D
-results are visualised with Plotly.
-
 Author: Immanuel Ampomah Mensah
 """
 
@@ -27,7 +21,6 @@ import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
 
-# Local modules
 from optimization_methods import (
     frank_wolfe_optimization,
     branch_and_cut_gurobi,
@@ -43,9 +36,6 @@ from graph_generation import (
     generate_3d_sphere_pose_graph,
 )
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Logging
-# ───────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
