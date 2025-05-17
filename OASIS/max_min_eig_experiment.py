@@ -410,8 +410,8 @@ def generate_summary_table(results, logger):
 def run_experiment_series():
     """Run a series of experiments with varying parameters"""
     # Parameter ranges
-    m_values = [5000, 10000, 25000, 50000]
-    n_values = [100, 500, 1000, 5000, 10000, 25000, 50000]
+    m_values = [100, 500, 1000, 5000, 10000]
+    n_values = [100, 500, 1000, 5000, 10000]
     k_fractions = [0.1, 0.2, 0.3, 0.4, 0.5]
     seeds = [42, 13, 71, 999, 123]
     

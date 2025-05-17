@@ -110,7 +110,7 @@ def min_eig_objective(x: np.ndarray, cache) -> float:
         v0 /= np.linalg.norm(v0)
         min_eig_objective.v0 = v0
     X = min_eig_objective.v0.reshape(-1, 1)
-    vals, vecs = lobpcg(F, X, M=M, largest=False, tol=1e-3, maxiter=20)
+    vals, vecs = lobpcg(F, X, M=M, largest=False, tol=1e-3, maxiter=1000)
     v = vecs[:, 0]
     min_eig_objective.v0 = v
     return float(vals[0])
@@ -125,7 +125,7 @@ def min_eig_gradient(x: np.ndarray, cache) -> np.ndarray:
         v0 = np.random.randn(F.shape[0])
         v0 /= np.linalg.norm(v0)
     X = v0.reshape(-1, 1)
-    vals, vecs = lobpcg(F, X, M=M, largest=False, tol=1e-3, maxiter=20)
+    vals, vecs = lobpcg(F, X, M=M, largest=False, tol=1e-3, maxiter=1000)
     v = vecs[:, 0]
     min_eig_objective.v0 = v
     Av_vals = cache["data0"] * v[cache["rows"]]
