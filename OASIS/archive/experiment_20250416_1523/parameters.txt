@@ -1,0 +1,8 @@
+Experiment Parameters:
+Graph type: pose_graph
+Number of poses: 100
+Number of loop closures: 20
+k (number to select): 4
+Algorithms used: fw, greedy, rounding, cr
+Time limit: 300 seconds
+Timestamp: 2025-04-16 15:23:20
