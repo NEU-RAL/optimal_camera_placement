@@ -3,3 +3,6 @@
 __pycache__
 results
 results*
+oasis.egg-info
+build
+.DS_Store
