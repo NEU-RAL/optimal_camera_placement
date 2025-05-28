@@ -410,20 +410,17 @@ def generate_summary_table(results, logger):
 def run_experiment_series():
     """Run a series of experiments with varying parameters"""
     # Parameter ranges
-    m_values = [100, 500, 1000, 5000, 10000]
-    n_values = [100, 500, 1000, 5000, 10000]
+    m_values = [100, 500]
+    n_values = [500, 1000]
     k_fractions = [0.1, 0.2, 0.3, 0.4, 0.5]
     seeds = [42, 13, 71, 999, 123]
     
-    # All algorithms to run
     all_algorithms = ['fw', 'greedy', 'rounding', 'cr', 'branch_and_cut']
     
-    # Create a timestamped base directory for this run
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_output_dir = f"results/{timestamp}_experiment_series"
     os.makedirs(base_output_dir, exist_ok=True)
     
-    # Set up logging for the experiment series
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -434,13 +431,11 @@ def run_experiment_series():
     )
     logger = logging.getLogger("experiment_series")
     
-    # Results storage
     all_results = []
     
     # Loop structure: m -> n -> k -> seed
     for m in m_values:
         for n in n_values:
-            # Skip if n > m as it doesn't make sense to have more matrices than matrix size
             if n > m:
                 logger.info(f"Skipping configuration m={m}, n={n} as n > m")
                 continue
@@ -575,14 +570,12 @@ def run_experiment_series():
                         
                     except Exception as e:
                         logger.error(f"ERROR in experiment m={m}, n={n}, k={k}, seed={seed}: {e}", exc_info=True)
-                        # Log the error but continue with other experiments
     
     logger.info("Experiment series complete!")
     return all_results
 
 
 if __name__ == "__main__":
-    # Parse command line arguments
     parser = argparse.ArgumentParser(description='Run optimization experiment series')
     parser.add_argument('--subset', action='store_true', help='Run a smaller subset of experiments for testing')
     args = parser.parse_args()

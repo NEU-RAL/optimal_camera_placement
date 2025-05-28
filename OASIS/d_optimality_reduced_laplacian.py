@@ -78,8 +78,8 @@ def run_experiments(
     if "fw" in algorithms:
         t0 = time.time()
         sol_fw, obj_fw, its, log = frank_wolfe_optimization(
-            obj, grad, np.zeros(n), A, b,
-            max_iterations=500, convergence_tol=1e-3, verbose=True
+            obj, grad, np.random.rand(n), A, b,
+            max_iterations=500, convergence_tol=1e-4, verbose=True
         )
         dt = time.time() - t0
         results["algorithms"]["frank_wolfe"] = {
@@ -199,15 +199,15 @@ def run_experiments(
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="Run D‑optimal reduced‑Laplacian experiments")
-    p.add_argument("--n",          type=int, default=100)
+    p.add_argument("--n",          type=int, default=1000)
     p.add_argument("--m",          type=int, default=100)
-    p.add_argument("--k",          type=int, default=10)
+    p.add_argument("--k",          type=int, default=100)
     p.add_argument("--remove_idx", type=int, default=0)
-    p.add_argument("--time_limit", type=int, default=300)
+    p.add_argument("--time_limit", type=int, default=100)
     p.add_argument("--seed",       type=int, default=42)
     p.add_argument("--output",     type=str, default=None)
     p.add_argument("--algorithms", nargs="+",
-                   default=["fw","greedy","rounding","cr","branch_and_cut"])
+                   default=["fw","greedy","rounding","cr"])
     args = p.parse_args()
 
     run_experiments(

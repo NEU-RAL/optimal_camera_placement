@@ -6,7 +6,7 @@ This document explains how to use the experiment runner.
 
 To run experiments with default settings:
 
-```bash
+```
 python test_space.py
 ```
 

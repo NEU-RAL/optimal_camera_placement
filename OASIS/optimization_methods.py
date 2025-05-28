@@ -66,7 +66,6 @@ def _backtracking(
         α *= beta
     return α
 
-
 # ---------------------------------------------------------------------
 #  Frank–Wolfe optimiser
 # ---------------------------------------------------------------------
@@ -102,8 +101,8 @@ def frank_wolfe_optimization(
         gap = g @ d
         g2  = np.linalg.norm(g)
 
-        # check convergence
-        if gap < convergence_tol * max(1, abs(f)):
+        # check convergence (enforce at least 2 iterations)
+        if k >= 2 and gap < convergence_tol * max(1, abs(f)):
             if verbose:
                 logger.info(f"Converged at iteration {k} (duality gap {gap:.2e}).")
             break
@@ -121,7 +120,7 @@ def frank_wolfe_optimization(
 
         iter_time = time.time() - t0
         for key, val in zip(
-            ("iter","obj_val","step_size","duality_gap","grad_norm","time_per_iter"),
+            ("iter", "obj_val", "step_size", "duality_gap", "grad_norm", "time_per_iter"),
             (k, f, α, gap, g2, iter_time)
         ):
             log[key].append(val)
@@ -129,13 +128,13 @@ def frank_wolfe_optimization(
         if verbose:
             logger.info(f"it={k:4d}  f={f:9.3e}  α={α:.3f}  gap={gap:5.2e}  t_iter={iter_time:.3f}s")
 
-    total_time = time.time() - overall_start  # ← compute total
+    total_time = time.time() - overall_start
     if verbose:
-        logger.info(f"Frank–Wolfe total runtime: {total_time:.3f} s over {len(log['iter'])} iterations")
+        logger.info(f"Frank–Wolfe total runtime: {total_time:.3f}s over {len(log['iter'])} iterations")
 
-    # final objective
     final_obj = obj_func(x, *args)
     return x, final_obj, len(log["iter"]), log
+
 
 def _solve_lmo(grad: np.ndarray,
                A: Optional[Union[np.ndarray, sp.spmatrix]],
@@ -200,7 +199,6 @@ def branch_and_cut_gurobi(
         logger.error("Gurobi is not available. Cannot perform branch and cut optimization.")
         return None, float('-inf'), {"status": "Gurobi not available"}
     
-    # Create a Gurobi model
     with gp.Env(empty=True) as env:
         env.setParam('OutputFlag', 1 if verbose else 0)
         env.start()
@@ -306,17 +304,13 @@ def branch_and_cut_gurobi(
                     
                     t_val = model.cbGetNodeRel(t)
                     
-                    # Skip if the solution is nearly binary (let MIPSOL handle it)
                     if all(xi < 0.1 or xi > 0.9 for xi in x_vals):
                         return
                     
-                    # Compute the objective value and gradient at this relaxed point
                     actual_obj = obj_func(x_vals, *args)
                     grad = obj_grad(x_vals, *args)
                     
-                    # Check if we need to add a cut
                     if t_val > actual_obj + 1e-6:
-                        # Add the cut
                         rhs = actual_obj - np.dot(grad, x_vals)
                         
                         cut_expr = gp.LinExpr()

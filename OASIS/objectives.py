@@ -140,10 +140,8 @@ def reduced_laplacian(
 ) -> List[Quadruplet]:
     reduced = []
     for q in quads:
-        # drop any entry in the removed row or column
         if q.row == remove_index or q.col == remove_index:
             continue
-        # shift indices > remove_index down by 1
         new_row = q.row - 1 if q.row > remove_index else q.row
         new_col = q.col - 1 if q.col > remove_index else q.col
         reduced.append( Quadruplet(q.matrix_idx, new_row, new_col, q.value) )
